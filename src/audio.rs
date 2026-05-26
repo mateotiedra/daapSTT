@@ -10,10 +10,10 @@
 //! WAV), we capture raw PCM and prepend a 44-byte WAV header ourselves.
 
 use anyhow::{Context, Result};
-use log::{debug, info};
+use log::{debug, info, warn};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::time::Duration;
+use tokio::time::{timeout, Duration};
 
 /// Captured audio as WAV bytes (16kHz, mono, 16-bit PCM).
 #[derive(Debug)]
@@ -32,23 +32,34 @@ pub struct RecordingHandle {
 impl RecordingHandle {
     /// Stop recording and collect the audio data.
     ///
-    /// Kills the pw-record subprocess, reads any remaining stdout,
-    /// and constructs a complete WAV buffer.
+    /// Sends SIGTERM to pw-record for graceful shutdown (allows it to flush
+    /// stdout buffers), reads all captured audio, then escalates to SIGKILL
+    /// if the process doesn't exit within 500ms.
     pub async fn stop(mut self) -> Result<AudioRecording> {
-        // Kill the pw-record process
-        debug!("killing pw-record process (pid: {:?})", self.child.id());
-        self.child.kill().await.context("failed to kill pw-record")?;
+        let pid = self.child.id().expect("pw-record has no pid");
+        debug!("stopping pw-record (pid: {pid})");
 
-        // Read remaining stdout
-        let mut raw_pcm = Vec::new();
-        if let Some(mut stdout) = self.child.stdout.take() {
-            stdout
-                .read_to_end(&mut raw_pcm)
-                .await
-                .context("failed to read pw-record stdout")?;
+        // Send SIGTERM for graceful shutdown — lets pw-record flush buffers
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
         }
 
-        // Wait for the process to exit
+        // Take stdout and read all data (blocks until pipe is closed)
+        let mut raw_pcm = Vec::new();
+        if let Some(mut stdout) = self.child.stdout.take() {
+            // Read with a timeout — if the process hangs, we escalate to SIGKILL
+            let read_result = timeout(Duration::from_millis(500), stdout.read_to_end(&mut raw_pcm)).await;
+            if read_result.is_err() {
+                warn!("pw-record did not exit after SIGTERM — sending SIGKILL");
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+                // Read remaining data after SIGKILL
+                let _ = timeout(Duration::from_millis(500), stdout.read_to_end(&mut raw_pcm)).await;
+            }
+        }
+
+        // Wait for the process to fully exit
         let status = self.child.wait().await.context("failed to wait for pw-record")?;
         debug!("pw-record exited with status: {status}");
 
