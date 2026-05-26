@@ -1,0 +1,21 @@
+[Unit]
+Description=Voice Input Daemon — global push-to-talk dictation via Groq Whisper
+Documentation=https://github.com/user/daapstt
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/daapstt
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-%h/.config/voice-daemon/env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-daemon
+
+# Grant access to input devices for evdev hotkey detection
+DeviceAllow=/dev/input/event* rw
+
+[Install]
+WantedBy=default.target

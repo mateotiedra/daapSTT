@@ -1,0 +1,33 @@
+[package]
+name = "daapstt"
+version = "0.1.0"
+edition = "2021"
+description = "Voice input daemon — global push-to-talk dictation via Groq Whisper API"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for Groq API
+reqwest = { version = "0.12", features = ["multipart", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Keyboard input via evdev
+evdev = "0.12"
+
+# XDG paths
+dirs = "5"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Signal handling
+tokio-util = { version = "0.7", features = ["io"] }
+libc = "0.2.186"
