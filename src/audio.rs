@@ -11,8 +11,11 @@
 
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 /// Threshold below which a recording is considered silent.
@@ -32,17 +35,25 @@ pub struct AudioRecording {
     pub peak_amplitude: i16,
 }
 
-/// Handle to an active recording — holds the subprocess.
+/// Handle to an active recording — holds the subprocess and a background
+/// task that continuously drains pw-record's stdout to prevent pipe buffer
+/// overflow (which would truncate recordings longer than ~2 seconds).
 pub struct RecordingHandle {
     child: Child,
+    /// Shared buffer collecting raw PCM from stdout. Locked by both the
+    /// drain task (writer) and stop() (reader, after drain completes).
+    raw_pcm: Arc<Mutex<Vec<u8>>>,
+    /// Background task that reads pw-record's stdout into `raw_pcm`.
+    drain_handle: JoinHandle<()>,
 }
 
 impl RecordingHandle {
     /// Stop recording and collect the audio data.
     ///
-    /// Sends SIGTERM to pw-record for graceful shutdown (allows it to flush
-    /// stdout buffers), reads all captured audio, then escalates to SIGKILL
-    /// if the process doesn't exit within 500ms.
+    /// Sends SIGTERM to pw-record for graceful shutdown, waits for the
+    /// process to exit, then awaits the background drain task to finish
+    /// collecting any remaining stdout data. Escalates to SIGKILL if the
+    /// process doesn't exit within 500ms.
     pub async fn stop(mut self) -> Result<AudioRecording> {
         let pid = self.child.id().expect("pw-record has no pid");
         debug!("stopping pw-record (pid: {pid})");
@@ -52,29 +63,45 @@ impl RecordingHandle {
             libc::kill(pid as i32, libc::SIGTERM);
         }
 
-        // Take stdout and read all data (blocks until pipe is closed)
-        let mut raw_pcm = Vec::new();
-        if let Some(mut stdout) = self.child.stdout.take() {
-            // Read with a timeout — if the process hangs, we escalate to SIGKILL
-            let read_result =
-                timeout(Duration::from_millis(500), stdout.read_to_end(&mut raw_pcm)).await;
-            if read_result.is_err() {
+        // Wait for the process to fully exit
+        let wait_result = timeout(Duration::from_millis(500), self.child.wait()).await;
+        match wait_result {
+            Ok(Ok(status)) => {
+                debug!("pw-record exited with status: {status}");
+            }
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!("failed to wait for pw-record: {e}"));
+            }
+            Err(_elapsed) => {
                 warn!("pw-record did not exit after SIGTERM — sending SIGKILL");
                 unsafe {
                     libc::kill(pid as i32, libc::SIGKILL);
                 }
-                // Read remaining data after SIGKILL
-                let _ = timeout(Duration::from_millis(500), stdout.read_to_end(&mut raw_pcm)).await;
+                // Wait again after SIGKILL
+                self.child
+                    .wait()
+                    .await
+                    .context("failed to wait for pw-record after SIGKILL")?;
             }
         }
 
-        // Wait for the process to fully exit
-        let status = self
-            .child
-            .wait()
-            .await
-            .context("failed to wait for pw-record")?;
-        debug!("pw-record exited with status: {status}");
+        // Await the background drain task — it will finish when pw-record
+        // closes its stdout pipe after exiting.
+        let drain_result = timeout(Duration::from_secs(2), self.drain_handle).await;
+        match drain_result {
+            Ok(Ok(())) => {
+                debug!("audio drain task completed");
+            }
+            Ok(Err(join_err)) => {
+                warn!("audio drain task panicked: {join_err}");
+            }
+            Err(_elapsed) => {
+                warn!("audio drain task timed out — using partial data");
+            }
+        }
+
+        // Take the collected raw PCM from the shared buffer
+        let raw_pcm = self.raw_pcm.lock().await.clone();
 
         let duration_secs = pcm_duration_secs(raw_pcm.len());
 
@@ -115,6 +142,11 @@ impl RecordingHandle {
 /// Spawns `pw-record` in raw mode and returns a handle that can be
 /// used to stop recording and collect the audio data.
 ///
+/// A background tokio task continuously drains pw-record's stdout into
+/// an in-memory buffer to prevent pipe buffer overflow. Without this,
+/// the 64KB Linux pipe buffer fills up in ~2 seconds at 16kHz/16-bit/mono,
+/// causing pw-record to block and truncate the recording.
+///
 /// When `record_target` is `Some`, forces pw-record to use that specific
 /// PipeWire node ID (obtainable via `pw-record --list-targets`).
 ///
@@ -148,13 +180,40 @@ pub fn start_recording(
         cmd.arg("--target").arg(target);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .context("failed to spawn pw-record — is PipeWire running?")?;
 
     debug!("pw-record spawned with pid {:?}", child.id());
 
-    Ok(RecordingHandle { child })
+    // Take stdout and spawn a background task to continuously drain it.
+    // This prevents the pipe buffer from filling up (64KB default on Linux),
+    // which would block pw-record and truncate recordings longer than ~2 seconds.
+    let mut stdout = child.stdout.take().expect("pw-record stdout not piped");
+    let raw_pcm = Arc::new(Mutex::new(Vec::new()));
+    let raw_pcm_clone = raw_pcm.clone();
+
+    let drain_handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) => break, // pipe closed — pw-record exited
+                Ok(n) => {
+                    raw_pcm_clone.lock().await.extend_from_slice(&buf[..n]);
+                }
+                Err(e) => {
+                    warn!("error reading pw-record stdout: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(RecordingHandle {
+        child,
+        raw_pcm,
+        drain_handle,
+    })
 }
 
 /// Build a standard WAV file from raw 16-bit signed little-endian PCM data.
