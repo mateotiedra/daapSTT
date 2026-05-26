@@ -260,10 +260,7 @@ fn find_keyboards() -> Result<Vec<KeyboardInfo>> {
 ///
 /// Runs in `spawn_blocking`. Sends `RawEvent` messages for relevant
 /// key presses/releases (Alt and Space).
-fn read_keyboard_events(
-    path: &std::path::Path,
-    tx: mpsc::Sender<RawEvent>,
-) {
+fn read_keyboard_events(path: &std::path::Path, tx: mpsc::Sender<RawEvent>) {
     // Try to open the device — if it fails, just return
     let mut device = loop {
         match Device::open(path) {
@@ -285,7 +282,10 @@ fn read_keyboard_events(
         }
     }
 
-    info!("monitoring keyboard device: {path:?} — {name}", name = device.name().unwrap_or("unknown"));
+    info!(
+        "monitoring keyboard device: {path:?} — {name}",
+        name = device.name().unwrap_or("unknown")
+    );
 
     loop {
         // Check if the channel has been closed (state machine exited)

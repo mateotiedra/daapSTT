@@ -15,6 +15,12 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::time::{timeout, Duration};
 
+/// Threshold below which a recording is considered silent.
+///
+/// 16-bit PCM ranges ±32767. A peak below 50 indicates the microphone
+/// is either muted, capturing the wrong source, or not producing signal.
+const SILENCE_THRESHOLD: i16 = 50;
+
 /// Captured audio as WAV bytes (16kHz, mono, 16-bit PCM).
 #[derive(Debug)]
 pub struct AudioRecording {
@@ -22,6 +28,8 @@ pub struct AudioRecording {
     pub data: Vec<u8>,
     /// Duration of the recording in seconds (approximate).
     pub duration_secs: f64,
+    /// Maximum absolute sample amplitude (0..32767). Used to detect silence.
+    pub peak_amplitude: i16,
 }
 
 /// Handle to an active recording — holds the subprocess.
@@ -48,7 +56,8 @@ impl RecordingHandle {
         let mut raw_pcm = Vec::new();
         if let Some(mut stdout) = self.child.stdout.take() {
             // Read with a timeout — if the process hangs, we escalate to SIGKILL
-            let read_result = timeout(Duration::from_millis(500), stdout.read_to_end(&mut raw_pcm)).await;
+            let read_result =
+                timeout(Duration::from_millis(500), stdout.read_to_end(&mut raw_pcm)).await;
             if read_result.is_err() {
                 warn!("pw-record did not exit after SIGTERM — sending SIGKILL");
                 unsafe {
@@ -60,23 +69,43 @@ impl RecordingHandle {
         }
 
         // Wait for the process to fully exit
-        let status = self.child.wait().await.context("failed to wait for pw-record")?;
+        let status = self
+            .child
+            .wait()
+            .await
+            .context("failed to wait for pw-record")?;
         debug!("pw-record exited with status: {status}");
 
         let duration_secs = pcm_duration_secs(raw_pcm.len());
 
         // Build WAV from raw PCM
         let wav_data = build_wav(&raw_pcm);
-        info!(
-            "recording complete: {} raw PCM bytes → {} WAV bytes, {:.2}s",
-            raw_pcm.len(),
-            wav_data.len(),
-            duration_secs
-        );
+        let peak = compute_peak_amplitude(&raw_pcm);
+        let silent = is_silence(peak);
+
+        // Save debug WAV so the user can inspect captured audio
+        save_debug_wav(&wav_data);
+
+        if silent {
+            warn!(
+                "recording appears silent — peak amplitude {} (threshold: {}). \
+                Check your microphone input source and volume in PipeWire.",
+                peak, SILENCE_THRESHOLD
+            );
+        } else {
+            info!(
+                "recording complete: {} raw PCM bytes → {} WAV bytes, {:.2}s, peak amp {}",
+                raw_pcm.len(),
+                wav_data.len(),
+                duration_secs,
+                peak
+            );
+        }
 
         Ok(AudioRecording {
             data: wav_data,
             duration_secs,
+            peak_amplitude: peak,
         })
     }
 }
@@ -86,13 +115,23 @@ impl RecordingHandle {
 /// Spawns `pw-record` in raw mode and returns a handle that can be
 /// used to stop recording and collect the audio data.
 ///
+/// When `record_target` is `Some`, forces pw-record to use that specific
+/// PipeWire node ID (obtainable via `pw-record --list-targets`).
+///
 /// Recording is automatically stopped after `max_duration` via a
 /// timeout that runs in the caller's context.
-pub fn start_recording(_max_duration: Duration) -> Result<RecordingHandle> {
-    info!("starting pw-record (raw PCM, 16kHz, mono, s16le)");
+pub fn start_recording(
+    _max_duration: Duration,
+    record_target: Option<&str>,
+) -> Result<RecordingHandle> {
+    if let Some(target) = record_target {
+        info!("starting pw-record (raw PCM, 16kHz, mono, s16le, target: {target})");
+    } else {
+        info!("starting pw-record (raw PCM, 16kHz, mono, s16le)");
+    }
 
-    let child = Command::new("pw-record")
-        .arg("-a") // raw mode — no container header
+    let mut cmd = Command::new("pw-record");
+    cmd.arg("-a") // raw mode — no container header
         .arg("--rate")
         .arg("16000")
         .arg("--channels")
@@ -103,15 +142,19 @@ pub fn start_recording(_max_duration: Duration) -> Result<RecordingHandle> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+
+    if let Some(target) = record_target {
+        cmd.arg("--target").arg(target);
+    }
+
+    let child = cmd
         .spawn()
         .context("failed to spawn pw-record — is PipeWire running?")?;
 
     debug!("pw-record spawned with pid {:?}", child.id());
 
-    Ok(RecordingHandle {
-        child,
-    })
+    Ok(RecordingHandle { child })
 }
 
 /// Build a standard WAV file from raw 16-bit signed little-endian PCM data.
@@ -154,6 +197,49 @@ fn pcm_duration_secs(byte_count: usize) -> f64 {
     byte_count as f64 / 32000.0
 }
 
+/// Compute the maximum absolute amplitude of raw 16-bit signed little-endian PCM.
+///
+/// Scans every pair of bytes as a little-endian i16 and returns the largest
+/// absolute value (0..32767). A value near 0 means the buffer is silent.
+fn compute_peak_amplitude(pcm: &[u8]) -> i16 {
+    let mut max = 0i16;
+    for chunk in pcm.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        let abs = sample.abs();
+        if abs > max {
+            max = abs;
+        }
+    }
+    max
+}
+
+/// Check whether a recording is effectively silent based on its peak amplitude.
+pub fn is_silence(peak: i16) -> bool {
+    peak < SILENCE_THRESHOLD
+}
+
+/// Save the WAV buffer to a debug file under `/tmp/` when debug logging is enabled.
+///
+/// The filename includes a UNIX timestamp so every recording is preserved.
+/// This lets users inspect captured audio in any audio player to diagnose
+/// microphone/source issues.
+fn save_debug_wav(wav_data: &[u8]) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = format!("/tmp/daapstt-debug-{timestamp}.wav");
+
+    match std::fs::write(&path, wav_data) {
+        Ok(()) => debug!("saved debug WAV to {path}"),
+        Err(e) => warn!("failed to save debug WAV to {path}: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +273,46 @@ mod tests {
         assert!((pcm_duration_secs(64000) - 2.0).abs() < 0.001);
         assert!((pcm_duration_secs(16000) - 0.5).abs() < 0.001);
         assert_eq!(pcm_duration_secs(0), 0.0);
+    }
+
+    #[test]
+    fn test_peak_amplitude_all_zeros() {
+        let pcm = vec![0u8; 32000];
+        assert_eq!(compute_peak_amplitude(&pcm), 0);
+        assert!(is_silence(compute_peak_amplitude(&pcm)));
+    }
+
+    #[test]
+    fn test_peak_amplitude_mixed_samples() {
+        // Create PCM with samples: 0, 100, -200, 0
+        let pcm: Vec<u8> = [
+            0x00, 0x00, // 0
+            0x64, 0x00, // 100
+            0x38, 0xFF, // -200 (0xFF38 in le)
+            0x00, 0x00, // 0
+        ]
+        .to_vec();
+        assert_eq!(compute_peak_amplitude(&pcm), 200);
+        assert!(!is_silence(compute_peak_amplitude(&pcm)));
+    }
+
+    #[test]
+    fn test_peak_amplitude_near_threshold() {
+        // Sample value of 49 should be considered silence
+        let pcm = vec![0x31, 0x00]; // 49
+        assert_eq!(compute_peak_amplitude(&pcm), 49);
+        assert!(is_silence(compute_peak_amplitude(&pcm)));
+
+        // Sample value of 50 should NOT be considered silence
+        let pcm = vec![0x32, 0x00]; // 50
+        assert_eq!(compute_peak_amplitude(&pcm), 50);
+        assert!(!is_silence(compute_peak_amplitude(&pcm)));
+    }
+
+    #[test]
+    fn test_peak_amplitude_odd_byte_ignored() {
+        // Odd byte count: last byte should be ignored
+        let pcm = vec![0x64, 0x00, 0x00]; // 100, then trailing 0
+        assert_eq!(compute_peak_amplitude(&pcm), 100);
     }
 }

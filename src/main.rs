@@ -29,12 +29,12 @@
 //! 7. On success: backspace `§`, type transcript via `deliver.rs`
 //! 8. On failure/silence: backspace `§`, notify via `notify.rs`
 
-mod config;
-mod hotkey;
 mod audio;
-mod transcribe;
+mod config;
 mod deliver;
+mod hotkey;
 mod notify;
+mod transcribe;
 
 use anyhow::Result;
 use log::{error, info, warn};
@@ -75,7 +75,10 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = config::Config::from_env()?;
-    info!("configuration loaded (model: {}, language: {})", config.model, config.language);
+    info!(
+        "configuration loaded (model: {}, language: {})",
+        config.model, config.language
+    );
 
     let mut state = RecordingState::new(config.marker_char.clone());
 
@@ -99,10 +102,10 @@ async fn main() -> Result<()> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
-            let mut sigint = signal(SignalKind::interrupt())
-                .expect("failed to register SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
 
             tokio::select! {
                 _ = sigterm.recv() => info!("received SIGTERM"),
@@ -174,12 +177,16 @@ async fn handle_press(
 
     // Start audio capture
     let max_dur = Duration::from_secs(config.max_recording_secs);
-    let recording_handle = match audio::start_recording(max_dur) {
+    let recording_handle = match audio::start_recording(max_dur, config.record_target.as_deref()) {
         Ok(handle) => handle,
         Err(e) => {
             warn!("failed to start recording: {e}");
             state.cleanup_marker().await;
-            let _ = notify::error("Voice daemon", "Failed to start recording — microphone not available?").await;
+            let _ = notify::error(
+                "Voice daemon",
+                "Failed to start recording — microphone not available?",
+            )
+            .await;
             return;
         }
     };
@@ -188,7 +195,8 @@ async fn handle_press(
     let release_received = tokio::time::timeout(
         Duration::from_secs(config.max_recording_secs),
         hotkey_rx.recv(),
-    ).await;
+    )
+    .await;
 
     match release_received {
         Ok(Some(hotkey::HotkeyEvent::Release)) => {
@@ -203,7 +211,10 @@ async fn handle_press(
             return;
         }
         Err(_elapsed) => {
-            info!("max recording duration ({}s) reached — auto-stopping", config.max_recording_secs);
+            info!(
+                "max recording duration ({}s) reached — auto-stopping",
+                config.max_recording_secs
+            );
         }
     }
 
@@ -223,8 +234,26 @@ async fn handle_press(
     // Check for silence / very short recording
     // WAV is 44-byte header + PCM data; < 800 bytes total ≈ < 0.02s of audio
     if audio_data.data.len() < 800 {
-        info!("recording too short ({:.2}s) — likely silence, discarding", audio_data.duration_secs);
+        info!(
+            "recording too short ({:.2}s) — likely silence, discarding",
+            audio_data.duration_secs
+        );
         state.cleanup_marker().await;
+        return;
+    }
+
+    // Check for silent audio (peak amplitude below threshold)
+    if audio::is_silence(audio_data.peak_amplitude) {
+        warn!(
+            "recording silent (peak amp {}) — skipping transcription",
+            audio_data.peak_amplitude
+        );
+        state.cleanup_marker().await;
+        let _ = notify::error(
+            "Voice daemon",
+            "Microphone appears silent — check your input volume/source in PipeWire",
+        )
+        .await;
         return;
     }
 

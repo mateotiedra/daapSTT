@@ -47,10 +47,16 @@ enum TranscriptionResponse {
 pub async fn transcribe(config: &Config, audio: &[u8]) -> Result<String> {
     // If the API URL is just a base URL (without the transcription endpoint path),
     // append the path automatically.
-    let api_url = if config.groq_api_url.contains("/openai/v1/audio/transcriptions") {
+    let api_url = if config
+        .groq_api_url
+        .contains("/openai/v1/audio/transcriptions")
+    {
         config.groq_api_url.clone()
     } else {
-        format!("{}/openai/v1/audio/transcriptions", config.groq_api_url.trim_end_matches('/'))
+        format!(
+            "{}/openai/v1/audio/transcriptions",
+            config.groq_api_url.trim_end_matches('/')
+        )
     };
 
     let client = reqwest::Client::builder()
@@ -81,7 +87,11 @@ pub async fn transcribe(config: &Config, audio: &[u8]) -> Result<String> {
                 let err_msg = e.to_string();
                 // Only retry on transient errors
                 if is_transient(&err_msg) && attempt < MAX_RETRIES {
-                    warn!("transient error (attempt {}/{}): {err_msg}", attempt + 1, MAX_RETRIES + 1);
+                    warn!(
+                        "transient error (attempt {}/{}): {err_msg}",
+                        attempt + 1,
+                        MAX_RETRIES + 1
+                    );
                     last_error = Some(e);
                     continue;
                 }
@@ -133,6 +143,8 @@ async fn try_transcribe(
                 .await
                 .context("failed to read transcription response body")?;
 
+            debug!("transcription response body: {text}");
+
             if text.trim().is_empty() {
                 Ok(TranscriptionResponse::NoSpeech)
             } else {
@@ -153,15 +165,11 @@ async fn try_transcribe(
         }
         code if code >= 500 => {
             let body = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "Groq API server error ({code}): {body}"
-            ))
+            Err(anyhow::anyhow!("Groq API server error ({code}): {body}"))
         }
         code => {
             let body = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "Groq API error ({code}): {body}"
-            ))
+            Err(anyhow::anyhow!("Groq API error ({code}): {body}"))
         }
     }
 }
@@ -184,8 +192,12 @@ mod tests {
 
     #[test]
     fn test_is_transient() {
-        assert!(is_transient("failed to send transcription request — network error?"));
-        assert!(is_transient("Groq API server error (503): service unavailable"));
+        assert!(is_transient(
+            "failed to send transcription request — network error?"
+        ));
+        assert!(is_transient(
+            "Groq API server error (503): service unavailable"
+        ));
         assert!(is_transient("connection timed out"));
         assert!(!is_transient("authentication failed (401)"));
         assert!(!is_transient("rate limited (429)"));
