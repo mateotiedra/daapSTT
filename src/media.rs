@@ -1,7 +1,8 @@
 //! Media player control via playerctl.
 //!
 //! Pauses all MPRIS-compatible media players (Spotify, browsers, VLC, etc.)
-//! when recording starts, and resumes them when recording ends.
+//! when recording starts, and resumes only the players that were actually
+//! playing at the time of the pause.
 //!
 //! Uses `playerctl` under the hood — the standard MPRIS controller for Linux.
 //! If playerctl is not installed, all operations are silent no-ops.
@@ -10,44 +11,75 @@ use log::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
-/// Tracks whether media was playing when we paused it,
-/// so we only resume if we actually paused something.
+/// Tracks media state at pause time.
+/// - `was_playing`: whether any player was playing (controls whether we pause)
+/// - `playing_players`: names of specific players that were playing (controls resume)
 pub struct MediaState {
     was_playing: Arc<AtomicBool>,
+    playing_players: Arc<Mutex<Vec<String>>>,
 }
 
 impl MediaState {
     pub fn new() -> Self {
         Self {
             was_playing: Arc::new(AtomicBool::new(false)),
+            playing_players: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn was_playing(&self) -> bool {
-        self.was_playing.load(Ordering::Relaxed)
     }
 }
 
-/// Check if any MPRIS player is currently playing, pause them if so,
-/// and record the state for later resume.
+/// Check which MPRIS players are playing, pause them all,
+/// and record both the playing status and specific player names.
 pub async fn pause_all(state: &MediaState) {
-    // 1. Check if anything is playing
-    let playing = match check_if_playing().await {
-        Ok(p) => p,
-        Err(()) => return, // playerctl not available
+    // 1. Get the full status output from all players.
+    //    We use an explicit format string to get both player name and status,
+    //    since the default output only includes statuses without names.
+    let output = match Command::new("playerctl")
+        .args([
+            "--all-players",
+            "status",
+            "--format",
+            "{{playerName}}\t{{status}}\n",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            debug!("playerctl not found or failed: {e}");
+            return;
+        }
     };
 
-    if !playing {
+    if !output.status.success() {
+        debug!(
+            "playerctl status exited with {} — treating as not playing",
+            output.status
+        );
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // 2. Simple check: does the output contain "Playing" anywhere?
+    if !stdout.contains("Playing") {
         debug!("no media players are playing — nothing to pause");
         return;
     }
 
-    debug!("media is playing — pausing all players");
-    state.was_playing.store(true, Ordering::Relaxed);
+    // 3. Extract the names of players that are currently playing
+    let playing_names = parse_playing_names(&stdout);
+    debug!("pausing: {:?}", playing_names);
 
-    // 2. Fire-and-forget pause
+    state.was_playing.store(true, Ordering::Relaxed);
+    *state.playing_players.lock().await = playing_names;
+
+    // 4. Fire-and-forget pause all players
     match Command::new("playerctl")
         .args(["--all-players", "pause"])
         .stdin(std::process::Stdio::null())
@@ -56,7 +88,6 @@ pub async fn pause_all(state: &MediaState) {
         .spawn()
     {
         Ok(mut child) => {
-            // Don't wait — let it run in background
             tokio::spawn(async move {
                 if let Err(e) = child.wait().await {
                     debug!("playerctl pause exited with error: {e}");
@@ -69,61 +100,69 @@ pub async fn pause_all(state: &MediaState) {
     }
 }
 
-/// Resume media playback — only if we paused something earlier.
+/// Resume media playback — only for players that were playing at pause time.
 pub async fn resume(state: &MediaState) {
     if !state.was_playing.load(Ordering::Relaxed) {
-        return; // nothing was playing when we paused
+        return;
     }
 
-    debug!("resuming media playback");
+    let players = state.playing_players.lock().await.clone();
 
-    match Command::new("playerctl")
-        .args(["--all-players", "play"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(mut child) => {
-            tokio::spawn(async move {
-                if let Err(e) = child.wait().await {
-                    debug!("playerctl play exited with error: {e}");
-                }
-            });
-        }
-        Err(e) => {
-            warn!("failed to spawn playerctl play: {e}");
+    if players.is_empty() {
+        return;
+    }
+
+    debug!("resuming: {:?}", players);
+
+    for player_name in &players {
+        match Command::new("playerctl")
+            .args(["--player", player_name.as_str(), "play"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let name = player_name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = child.wait().await {
+                        debug!("playerctl play for '{name}' exited with error: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("failed to spawn playerctl play for '{player_name}': {e}");
+            }
         }
     }
 }
 
-/// Run `playerctl --all-players status` and check if any player reports "Playing".
+/// Parse the output of `playerctl --all-players status --format '...'`.
 ///
-/// Returns `Err(())` if playerctl is not installed or fails to execute.
-async fn check_if_playing() -> Result<bool, ()> {
-    let output = match Command::new("playerctl")
-        .args(["--all-players", "status"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-    {
-        Ok(out) => out,
-        Err(e) => {
-            debug!("playerctl not found or failed: {e}");
-            return Err(());
-        }
-    };
+/// Format is tab-separated: `playerName\tstatus`, one per line.
+/// Example:
+/// ```text
+/// firefox	Paused
+/// spotify	Playing
+/// ```
+fn parse_playing_names(stdout: &str) -> Vec<String> {
+    let mut playing = Vec::new();
 
-    if !output.status.success() {
-        debug!(
-            "playerctl status exited with {} — treating as not playing",
-            output.status
-        );
-        return Ok(false);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Split on tab: "spotify\tPlaying" → ("spotify", "Playing")
+        if let Some(tab) = line.find('\t') {
+            let player = &line[..tab];
+            let status = &line[tab + 1..];
+            if status.eq_ignore_ascii_case("Playing") {
+                playing.push(player.to_string());
+            }
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.contains("Playing"))
+    playing
 }
