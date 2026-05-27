@@ -29,6 +29,9 @@ pub struct Config {
     /// Optional PipeWire target node ID for recording.
     /// When set, forces pw-record to use this specific input device.
     pub record_target: Option<String>,
+    /// Whether to pause media players (via playerctl) when recording starts.
+    /// When enabled, media is paused on hotkey press and resumed on release.
+    pub pause_media: bool,
 }
 
 impl Config {
@@ -81,6 +84,10 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
             record_target: env::var("VOICE_RECORD_TARGET").ok(),
+            pause_media: env::var("VOICE_PAUSE_MEDIA")
+                .ok()
+                .map(|v| v.to_lowercase() != "false" && v != "0")
+                .unwrap_or(true),
         })
     }
 }

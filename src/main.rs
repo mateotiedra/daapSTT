@@ -33,6 +33,7 @@ mod audio;
 mod config;
 mod deliver;
 mod hotkey;
+mod media;
 mod notify;
 mod transcribe;
 
@@ -42,12 +43,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
-/// Wrapper to track whether we need to clean up the § marker.
+/// Wrapper to track recording session state.
 struct RecordingState {
     /// Whether the § marker has been typed (and needs cleanup).
     marker_active: bool,
-    /// Current config reference for cleanup purposes.
+    /// Current marker character for cleanup purposes.
     marker_char: String,
+    /// Tracks whether media was playing when recording started,
+    /// so we can resume it when recording ends.
+    media_state: media::MediaState,
 }
 
 impl RecordingState {
@@ -55,6 +59,7 @@ impl RecordingState {
         Self {
             marker_active: false,
             marker_char,
+            media_state: media::MediaState::new(),
         }
     }
 
@@ -168,9 +173,15 @@ async fn handle_press(
 ) {
     info!("recording started");
 
+    // Pause media players before recording starts
+    if config.pause_media {
+        media::pause_all(&state.media_state).await;
+    }
+
     // Type marker character
     if let Err(e) = deliver::type_marker(&state.marker_char).await {
         warn!("failed to type marker: {e}");
+        media::resume(&state.media_state).await;
         return;
     }
     state.marker_active = true;
@@ -182,6 +193,7 @@ async fn handle_press(
         Err(e) => {
             warn!("failed to start recording: {e}");
             state.cleanup_marker().await;
+            media::resume(&state.media_state).await;
             let _ = notify::error(
                 "Voice daemon",
                 "Failed to start recording — microphone not available?",
@@ -208,6 +220,7 @@ async fn handle_press(
         Ok(None) => {
             info!("hotkey channel closed, stopping");
             state.cleanup_marker().await;
+            media::resume(&state.media_state).await;
             return;
         }
         Err(_elapsed) => {
@@ -226,6 +239,7 @@ async fn handle_press(
         Err(e) => {
             warn!("audio capture error: {e}");
             state.cleanup_marker().await;
+            media::resume(&state.media_state).await;
             let _ = notify::error("Voice daemon", "Audio capture failed").await;
             return;
         }
@@ -239,6 +253,7 @@ async fn handle_press(
             audio_data.duration_secs
         );
         state.cleanup_marker().await;
+        media::resume(&state.media_state).await;
         return;
     }
 
@@ -249,6 +264,7 @@ async fn handle_press(
             audio_data.peak_amplitude
         );
         state.cleanup_marker().await;
+        media::resume(&state.media_state).await;
         let _ = notify::error(
             "Voice daemon",
             "Microphone appears silent — check your input volume/source in PipeWire",
@@ -262,11 +278,13 @@ async fn handle_press(
         Ok(text) if text.trim().is_empty() => {
             info!("empty transcription — silence");
             state.cleanup_marker().await;
+            media::resume(&state.media_state).await;
         }
         Ok(text) => {
             info!("transcription: {text}");
             state.cleanup_marker().await;
             let _ = deliver::type_text(&text).await;
+            media::resume(&state.media_state).await;
         }
         Err(e) => {
             let err_msg = e.to_string();
@@ -285,6 +303,7 @@ async fn handle_press(
 
             state.cleanup_marker().await;
             let _ = notify::error("Voice daemon", notify_msg).await;
+            media::resume(&state.media_state).await;
         }
     }
 }
