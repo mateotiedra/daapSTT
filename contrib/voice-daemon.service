@@ -9,6 +9,8 @@ Type=simple
 ExecStart=%h/.local/bin/daapstt
 Restart=on-failure
 RestartSec=5
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 EnvironmentFile=-%h/.config/voice-daemon/env
 StandardOutput=journal
 StandardError=journal
