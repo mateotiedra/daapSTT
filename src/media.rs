@@ -33,6 +33,11 @@ impl MediaState {
 /// Check which MPRIS players are playing, pause them all,
 /// and record both the playing status and specific player names.
 pub async fn pause_all(state: &MediaState) {
+    // Each recording gets a fresh snapshot. Otherwise a prior recording's
+    // players could be resumed after a later recording that found none playing.
+    state.was_playing.store(false, Ordering::Relaxed);
+    state.playing_players.lock().await.clear();
+
     // 1. Get the full status output from all players.
     //    We use an explicit format string to get both player name and status,
     //    since the default output only includes statuses without names.
@@ -66,14 +71,14 @@ pub async fn pause_all(state: &MediaState) {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // 2. Simple check: does the output contain "Playing" anywhere?
-    if !stdout.contains("Playing") {
+    // 2. Extract the names of players that are currently playing.
+    let playing_names = parse_playing_names(&stdout);
+    if playing_names.is_empty() {
         debug!("no media players are playing — nothing to pause");
         return;
     }
 
-    // 3. Extract the names of players that are currently playing
-    let playing_names = parse_playing_names(&stdout);
+    // 3. Record this recording's players before pausing them.
     debug!("pausing: {:?}", playing_names);
 
     state.was_playing.store(true, Ordering::Relaxed);
@@ -102,13 +107,12 @@ pub async fn pause_all(state: &MediaState) {
 
 /// Resume media playback — only for players that were playing at pause time.
 pub async fn resume(state: &MediaState) {
-    if !state.was_playing.load(Ordering::Relaxed) {
-        return;
-    }
+    // Consume the snapshot before issuing play commands so a second resume call
+    // cannot replay a prior recording's players.
+    let was_playing = state.was_playing.swap(false, Ordering::Relaxed);
+    let players = std::mem::take(&mut *state.playing_players.lock().await);
 
-    let players = state.playing_players.lock().await.clone();
-
-    if players.is_empty() {
+    if !was_playing || players.is_empty() {
         return;
     }
 
@@ -165,4 +169,16 @@ fn parse_playing_names(stdout: &str) -> Vec<String> {
     }
 
     playing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_playing_names;
+
+    #[test]
+    fn records_only_players_that_are_playing() {
+        let output = "firefox\tPaused\nspotify\tPlaying\nvlc\tStopped\nmpv\tplaying\n";
+
+        assert_eq!(parse_playing_names(output), ["spotify", "mpv"]);
+    }
 }
