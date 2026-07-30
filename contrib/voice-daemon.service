@@ -1,5 +1,5 @@
 [Unit]
-Description=Voice Input Daemon — global push-to-talk dictation via Groq Whisper
+Description=Voice Input Daemon — global push-to-talk dictation via ElevenLabs Scribe v2
 Documentation=https://github.com/user/daapstt
 After=pipewire.service
 Wants=pipewire.service

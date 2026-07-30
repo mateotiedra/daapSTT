@@ -38,8 +38,8 @@ install: build
 	cp contrib/voice-daemon.service $(SERVICE_DIR)/voice-daemon.service
 	@echo "  → $(SERVICE_DIR)/voice-daemon.service"
 	@mkdir -p $(CONFIG_DIR)
-	@test -f $(CONFIG_DIR)/env || echo "# Groq API key — get one at https://console.groq.com/keys\nGROQ_API_KEY=" > $(CONFIG_DIR)/env
-	@echo "  → $(CONFIG_DIR)/env (created if missing — fill in your API key)"
+	@test -f $(CONFIG_DIR)/env || echo "# ElevenLabs API key — get one at https://elevenlabs.io/app/settings/api-keys\nELEVENLABS_API_KEY=" > $(CONFIG_DIR)/env
+	@echo "  → $(CONFIG_DIR)/env (created if missing — fill in your ElevenLabs API key)"
 	@echo ""
 	@echo "Run the following to start the daemon:"
 	@echo "  systemctl --user daemon-reload"

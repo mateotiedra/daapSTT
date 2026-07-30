@@ -1,4 +1,4 @@
-//! Voice Input Daemon — global push-to-talk dictation via Groq Whisper API.
+//! Voice Input Daemon — global push-to-talk dictation via ElevenLabs Scribe v2.
 //!
 //! # Architecture
 //!
@@ -10,7 +10,7 @@
 //!                    ┌─────────────────┼─────────────────┐
 //!                    ▼                 ▼                  ▼
 //!              audio.rs         transcribe.rs        deliver.rs
-//!           (pw-record)        (Groq API)          (wtype)
+//!           (pw-record)    (ElevenLabs API)        (wtype)
 //!                    │                 │                  │
 //!                    └─────────────────┴──────────────────┘
 //!                                      │
@@ -25,7 +25,7 @@
 //! 3. Orchestrator starts `pw-record` via `audio.rs`
 //! 4. User releases Alt+Space → `hotkey.rs` emits `Release`
 //! 5. Orchestrator stops recording, gets WAV buffer
-//! 6. Orchestrator sends WAV to Groq via `transcribe.rs`
+//! 6. Orchestrator sends WAV to ElevenLabs via `transcribe.rs`
 //! 7. On success: backspace `§`, type transcript via `deliver.rs`
 //! 8. On failure/silence: backspace `§`, notify via `notify.rs`
 
@@ -33,6 +33,7 @@ mod audio;
 mod config;
 mod deliver;
 mod hotkey;
+mod keyterms;
 mod media;
 mod notify;
 mod transcribe;
@@ -73,6 +74,10 @@ impl RecordingState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(command) = std::env::args().nth(1) {
+        return run_command(command, std::env::args().skip(2));
+    }
+
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -80,10 +85,7 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = config::Config::from_env()?;
-    info!(
-        "configuration loaded (model: {}, language: {})",
-        config.model, config.language
-    );
+    info!("configuration loaded");
 
     let mut state = RecordingState::new(config.marker_char.clone());
 
@@ -163,6 +165,30 @@ async fn main() -> Result<()> {
     let _ = hotkey_handle.await;
     info!("voice-daemon shut down");
     Ok(())
+}
+
+fn run_command(command: String, args: impl Iterator<Item = String>) -> Result<()> {
+    if command != "keyterms" {
+        anyhow::bail!("unknown command: {command}\n\n{}", usage());
+    }
+
+    let args = args.collect::<Vec<_>>();
+    match args.as_slice() {
+        [] => keyterms::interactive(),
+        [subcommand] if subcommand == "list" => {
+            for term in keyterms::load()? {
+                println!("{term}");
+            }
+            Ok(())
+        }
+        [subcommand, term] if subcommand == "add" => keyterms::add(term),
+        [subcommand, term] if subcommand == "remove" => keyterms::remove(term),
+        _ => anyhow::bail!("invalid keyterms command\n\n{}", usage()),
+    }
+}
+
+fn usage() -> &'static str {
+    "Usage:\n  daapstt                 Start the voice daemon\n  daapstt keyterms        Manage keyterms interactively\n  daapstt keyterms list\n  daapstt keyterms add <term>\n  daapstt keyterms remove <term>"
 }
 
 /// Handle a press event: record, transcribe, deliver.
@@ -294,7 +320,7 @@ async fn handle_press(
             let notify_msg = if err_msg.contains("rate limited") || err_msg.contains("429") {
                 "Rate limited — try again shortly"
             } else if err_msg.contains("authentication") || err_msg.contains("401") {
-                "Authentication failed — check GROQ_API_KEY"
+                "Authentication failed — check ELEVENLABS_API_KEY"
             } else if err_msg.contains("network error") || err_msg.contains("timeout") {
                 "Transcription failed — check network connection"
             } else {

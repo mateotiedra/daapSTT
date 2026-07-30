@@ -2,13 +2,13 @@
 name = "daapstt"
 version = "0.1.0"
 edition = "2021"
-description = "Voice input daemon — global push-to-talk dictation via Groq Whisper API"
+description = "Voice input daemon — global push-to-talk dictation via ElevenLabs Scribe v2"
 
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client for Groq API
+# HTTP client for ElevenLabs API
 reqwest = { version = "0.12", features = ["multipart", "json"] }
 
 # Serialization
@@ -31,3 +31,6 @@ env_logger = "0.11"
 # Signal handling
 tokio-util = { version = "0.7", features = ["io"] }
 libc = "0.2.186"
+
+# Raw terminal input for interactive keyterm management.
+crossterm = "0.28"

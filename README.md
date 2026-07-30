@@ -2,63 +2,84 @@
 
 Global push-to-talk speech-to-text dictation for Wayland. Hold **Alt+Space**, speak, release — your words appear in the active window.
 
-Uses [Groq's Whisper API](https://console.groq.com) (free tier: 2,000 req/day) — no GPU, no CUDA, no model files.
+Uses [ElevenLabs Scribe v2](https://elevenlabs.io/docs/speech-to-text) for transcription: no GPU, CUDA, or local model files are required.
 
 ## How It Works
 
 ```
 Alt+Space held ──► § marker appears ──► you speak ──► release key
                                                           │
-                 transcribed text appears ◄── Groq API ◄──┘
+             transcribed text appears ◄── ElevenLabs API ◄┘
 ```
 
 ## Prerequisites
 
 - **Linux** with Wayland (tested on Hyprland)
 - **PipeWire** for audio capture
-- **wtype**, **pw-record**, **notify-send** installed
+- **wtype**, **pw-record**, and **notify-send** installed
 - **input** group membership for `/dev/input/event*` access
+- An [ElevenLabs API key](https://elevenlabs.io/app/settings/api-keys)
 - **Rust** toolchain (for building from source)
 
 ## Quick Start
 
 ```bash
-# 1. Get a Groq API key (free) at https://console.groq.com/keys
-# 2. Set it in the env file
-echo 'GROQ_API_KEY=gsk_your_key_here' > ~/.config/voice-daemon/env
+# 1. Put your ElevenLabs API key in the env file
+mkdir -p ~/.config/voice-daemon
+echo 'ELEVENLABS_API_KEY=your_key_here' > ~/.config/voice-daemon/env
 
-# 3. Build and install
+# 2. Build and install
 make install
 
-# 4. Start the daemon
+# 3. Start the daemon
 systemctl --user daemon-reload
 systemctl --user enable --now voice-daemon
 
-# 5. Watch logs
+# 4. Watch logs
 journalctl --user -u voice-daemon -f
 ```
 
 ## Usage
 
 | Action | Result |
-|--------|--------|
+| --- | --- |
 | Hold **Alt+Space** | `§` appears at cursor |
 | Speak into mic | Audio captured |
 | Release **Alt+Space** | `§` removed, text appears |
 | Quick tap (< 0.05s) | `§` removed, no action |
 
+## Keyterms
+
+Keyterms help Scribe recognize names, product names, and other specialized vocabulary. They are stored locally in `~/.config/voice-daemon/keyterms.txt`, one trimmed phrase per line. Empty lines are ignored; terms are case-sensitive, deduplicated in insertion order, limited to 1,000 entries, and each term may contain at most 50 Unicode characters and five words. ElevenLabs does not accept `<`, `>`, `{`, `}`, `[`, `]`, or `\` in a term.
+
+Manage them from an interactive terminal (not from the background daemon):
+
+```bash
+daapstt keyterms
+```
+
+Controls: **↑/↓** or **j/k** move the selection; **D** (uppercase) asks to delete the selected term; only **y** or **Y** confirms; **q** or **Esc** exits.
+
+Scriptable commands are also available:
+
+```bash
+daapstt keyterms list
+daapstt keyterms add "ElevenLabs Scribe"
+daapstt keyterms remove "ElevenLabs Scribe"
+```
+
+ElevenLabs Scribe v2 transcription costs $0.22/hour base. Keyterm prompting adds $0.05/hour.
+
 ## Configuration
 
-All via environment variables in `~/.config/voice-daemon/env`:
+Set these variables in `~/.config/voice-daemon/env`:
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `GROQ_API_KEY` | *(required)* | Groq API key |
-| `GROQ_API_URL` | `https://api.groq.com/openai/v1/audio/transcriptions` | API endpoint |
-| `GROQ_MODEL` | `whisper-large-v3-turbo` | Whisper model |
-| `GROQ_LANGUAGE` | `en` | Transcription language |
+| --- | --- | --- |
+| `ELEVENLABS_API_KEY` | *(required)* | ElevenLabs API key |
+| `ELEVENLABS_API_URL` | `https://api.elevenlabs.io/v1/speech-to-text` | API endpoint (normally leave unchanged) |
 | `VOICE_MARKER_CHAR` | `§` | Recording indicator character |
-| `VOICE_MAX_RECORDING_SECS` | `60` | Max recording duration |
+| `VOICE_MAX_RECORDING_SECS` | `60` | Maximum recording duration |
 
 ## Architecture
 
@@ -70,12 +91,11 @@ evdev keyboard ──► hotkey.rs ──► (Press/Release via channel)
                    ┌─────────────────┼─────────────────┐
                    ▼                 ▼                  ▼
              audio.rs         transcribe.rs        deliver.rs
-          (pw-record)         (Groq API)           (wtype)
+          (pw-record)       (ElevenLabs API)        (wtype)
                    │                 │                  │
                    └─────────────────┴──────────────────┘
                                      │
                                notify.rs
-                            (notify-send)
 ```
 
 ## Development

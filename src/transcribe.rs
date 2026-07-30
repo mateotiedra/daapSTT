@@ -1,189 +1,220 @@
-//! Transcription via Groq Whisper API.
+//! Transcription via the ElevenLabs Scribe batch API.
 //!
-//! Sends WAV audio to `api.groq.com/openai/v1/audio/transcriptions`
-//! and returns the transcribed text.
+//! WAV audio is submitted to `POST /v1/speech-to-text` using Scribe v2.
+//! Keyterms are loaded for every transcription and sent as repeated multipart
+//! `keyterms` fields, as required for the API's array parameter.
 //!
-//! # API
+//! # Retry policy
 //!
-//! Uses Groq's OpenAI-compatible audio transcription endpoint.
-//! Free tier: 2,000 requests/day, 7,200 audio seconds/hour.
-//! No credit card required.
-//!
-//! # Retry Policy
-//!
-//! Retries on transient failures (network timeout, 5xx) up to 2 times
-//! with exponential backoff: 1s, then 2s.
+//! Retries only timeout/network transport failures and 5xx responses, up to
+//! two times with backoff of one then two seconds.
 
 use crate::config::Config;
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use reqwest::multipart::{Form, Part};
+use reqwest::StatusCode;
+use serde::Deserialize;
 use std::time::Duration;
 
-/// Maximum number of retry attempts for transient failures.
+/// Maximum number of retries after the initial request.
 const MAX_RETRIES: u32 = 2;
+const MAX_KEYTERMS: usize = 1000;
+const MAX_KEYTERM_CHARS: usize = 50;
+const MAX_KEYTERM_WORDS: usize = 5;
 
-/// Groq Transcription API response types.
-#[derive(Debug)]
-enum TranscriptionResponse {
-    /// Successful transcription — plain text.
-    Success(String),
-    /// The audio contained no speech.
-    NoSpeech,
+#[derive(Deserialize)]
+struct ScribeResponse {
+    text: String,
 }
 
-/// Send audio data to the Groq Whisper API for transcription.
-///
-/// Takes a WAV buffer and returns the transcribed text.
-/// Retries automatically on transient failures (5xx, network errors).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusClass {
+    Authentication,
+    RateLimited,
+    Request,
+    Server,
+}
+
+/// Send WAV audio to ElevenLabs Scribe and return the transcribed text.
 ///
 /// # Errors
 ///
-/// Returns an error on:
-/// - Network failures after retries exhausted
-/// - API authentication errors (401)
-/// - Rate limiting (429)
-/// - Invalid audio or request (4xx, other than 429)
+/// Returns an error for invalid credentials, rate limits, invalid requests,
+/// provider errors, invalid responses, or transport failures after retries.
 pub async fn transcribe(config: &Config, audio: &[u8]) -> Result<String> {
-    // If the API URL is just a base URL (without the transcription endpoint path),
-    // append the path automatically.
-    let api_url = if config
-        .groq_api_url
-        .contains("/openai/v1/audio/transcriptions")
-    {
-        config.groq_api_url.clone()
-    } else {
-        format!(
-            "{}/openai/v1/audio/transcriptions",
-            config.groq_api_url.trim_end_matches('/')
-        )
-    };
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("failed to create HTTP client")?;
 
-    // Retry loop — build a fresh form on each attempt
-    let mut last_error = None;
+    // Keyterms are intentionally loaded for every request so edits take effect
+    // without restarting the daemon.
+    let keyterms = valid_keyterms(crate::keyterms::load().context("failed to load keyterms")?);
+
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
-            let backoff = Duration::from_secs(1 << (attempt - 1)); // 1s, 2s
-            debug!("retry attempt {attempt} after {backoff:?}");
+            let backoff = Duration::from_secs(1 << (attempt - 1));
+            debug!("retrying transcription after {backoff:?}");
             tokio::time::sleep(backoff).await;
         }
 
-        match try_transcribe(&client, &api_url, &config.groq_api_key, audio, config).await {
-            Ok(TranscriptionResponse::Success(text)) => {
-                let trimmed = text.trim();
-                info!("transcription successful: {trimmed}");
-                return Ok(trimmed.to_string());
+        match try_transcribe(
+            &client,
+            &config.elevenlabs_api_url,
+            &config.elevenlabs_api_key,
+            audio,
+            &keyterms,
+        )
+        .await
+        {
+            Ok(text) => {
+                info!("transcription successful");
+                return Ok(text.trim().to_string());
             }
-            Ok(TranscriptionResponse::NoSpeech) => {
-                info!("transcription returned no speech");
-                return Ok(String::new());
-            }
-            Err(e) => {
-                let err_msg = e.to_string();
-                // Only retry on transient errors
-                if is_transient(&err_msg) && attempt < MAX_RETRIES {
+            Err(AttemptError::Transport(error)) if is_transient_transport(&error) => {
+                if attempt < MAX_RETRIES {
                     warn!(
-                        "transient error (attempt {}/{}): {err_msg}",
+                        "transcription transport failure (attempt {}/{})",
                         attempt + 1,
                         MAX_RETRIES + 1
                     );
-                    last_error = Some(e);
                     continue;
                 }
-                return Err(e);
+                return Err(transport_error(&error));
+            }
+            Err(AttemptError::Transport(error)) => return Err(transport_error(&error)),
+            Err(AttemptError::Status(status)) if is_transient_status(status) => {
+                if attempt < MAX_RETRIES {
+                    warn!(
+                        "transcription server failure (attempt {}/{}): {}",
+                        attempt + 1,
+                        MAX_RETRIES + 1,
+                        status.as_u16()
+                    );
+                    continue;
+                }
+                return Err(status_error(status));
+            }
+            Err(AttemptError::Status(status)) => return Err(status_error(status)),
+            Err(AttemptError::InvalidResponse) => {
+                return Err(anyhow::anyhow!(
+                    "invalid transcription response from ElevenLabs"
+                ));
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("transcription failed after retries")))
+    unreachable!("the retry loop always returns")
 }
 
-/// Attempt a single transcription request.
+enum AttemptError {
+    Transport(reqwest::Error),
+    Status(StatusCode),
+    InvalidResponse,
+}
+
+/// Attempt one Scribe request without retrying.
 async fn try_transcribe(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
     audio: &[u8],
-    config: &Config,
-) -> Result<TranscriptionResponse> {
-    // Build multipart form for this attempt
+    keyterms: &[String],
+) -> std::result::Result<String, AttemptError> {
     let audio_part = Part::bytes(audio.to_vec())
         .file_name("recording.wav")
         .mime_str("audio/wav")
-        .context("failed to set MIME type for audio part")?;
+        .map_err(AttemptError::Transport)?;
 
-    let form = Form::new()
+    // The API schema declares keyterms as a multipart array. Reqwest encodes
+    // this as one `keyterms` part per item, matching the official SDK's list
+    // submission rather than serializing the list as a JSON string.
+    let mut form = Form::new()
         .part("file", audio_part)
-        .text("model", config.model.clone())
-        .text("language", config.language.clone())
-        .text("response_format", config.response_format.clone());
+        .text("model_id", "scribe_v2");
+    for keyterm in keyterms {
+        form = form.text("keyterms", keyterm.clone());
+    }
 
-    debug!("POST {url}");
-
+    debug!("POST ElevenLabs speech-to-text endpoint");
     let response = client
         .post(url)
-        .header("Authorization", format!("Bearer {api_key}"))
+        .header("xi-api-key", api_key)
         .multipart(form)
         .send()
         .await
-        .context("failed to send transcription request — network error?")?;
+        .map_err(AttemptError::Transport)?;
 
     let status = response.status();
-    debug!("response status: {status}");
+    debug!(
+        "ElevenLabs speech-to-text response status: {}",
+        status.as_u16()
+    );
+    if !status.is_success() {
+        // Do not read or log provider error bodies: they may contain request data.
+        return Err(AttemptError::Status(status));
+    }
 
+    let body = response.bytes().await.map_err(AttemptError::Transport)?;
+    parse_transcription(&body).map_err(|_| AttemptError::InvalidResponse)
+}
+
+fn parse_transcription(body: &[u8]) -> Result<String, serde_json::Error> {
+    serde_json::from_slice::<ScribeResponse>(body).map(|response| response.text)
+}
+
+fn classify_status(status: StatusCode) -> StatusClass {
     match status.as_u16() {
-        200 => {
-            let text = response
-                .text()
-                .await
-                .context("failed to read transcription response body")?;
-
-            debug!("transcription response body: {text}");
-
-            if text.trim().is_empty() {
-                Ok(TranscriptionResponse::NoSpeech)
-            } else {
-                Ok(TranscriptionResponse::Success(text))
-            }
-        }
-        401 => {
-            let body = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "authentication failed (401) — check GROQ_API_KEY. Response: {body}"
-            ))
-        }
-        429 => {
-            let body = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "rate limited (429) — too many requests. Response: {body}"
-            ))
-        }
-        code if code >= 500 => {
-            let body = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!("Groq API server error ({code}): {body}"))
-        }
-        code => {
-            let body = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!("Groq API error ({code}): {body}"))
-        }
+        401 => StatusClass::Authentication,
+        429 => StatusClass::RateLimited,
+        500..=599 => StatusClass::Server,
+        _ => StatusClass::Request,
     }
 }
 
-/// Check if an error message indicates a transient failure worth retrying.
-fn is_transient(error_msg: &str) -> bool {
-    let msg = error_msg.to_lowercase();
-    msg.contains("network error")
-        || msg.contains("timeout")
-        || msg.contains("connection")
-        || msg.contains("server error (5")
-        || msg.contains("503")
-        || msg.contains("502")
-        || msg.contains("504")
+fn is_transient_status(status: StatusCode) -> bool {
+    classify_status(status) == StatusClass::Server
+}
+
+fn is_transient_transport(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
+}
+
+fn transport_error(error: &reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow::anyhow!("transcription request timed out")
+    } else {
+        anyhow::anyhow!("transcription request failed due to a network error")
+    }
+}
+
+fn status_error(status: StatusCode) -> anyhow::Error {
+    match classify_status(status) {
+        StatusClass::Authentication => anyhow::anyhow!(
+            "authentication failed (401) — check ELEVENLABS_API_KEY in ~/.config/voice-daemon/env"
+        ),
+        StatusClass::RateLimited => anyhow::anyhow!("rate limited (429) — too many requests"),
+        StatusClass::Server => anyhow::anyhow!("ElevenLabs server error ({})", status.as_u16()),
+        StatusClass::Request => anyhow::anyhow!("ElevenLabs request error ({})", status.as_u16()),
+    }
+}
+
+/// Keep only keyterms accepted by ElevenLabs and cap the list at its limit.
+/// Invalid entries are ignored rather than making a recording fail.
+fn valid_keyterms(keyterms: Vec<String>) -> Vec<String> {
+    keyterms
+        .into_iter()
+        .filter(|term| {
+            !term.is_empty()
+                && term.chars().count() <= MAX_KEYTERM_CHARS
+                && term.split_whitespace().count() <= MAX_KEYTERM_WORDS
+                && !term
+                    .chars()
+                    .any(|c| matches!(c, '<' | '>' | '{' | '}' | '[' | ']' | '\\'))
+        })
+        .take(MAX_KEYTERMS)
+        .collect()
 }
 
 #[cfg(test)]
@@ -191,16 +222,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_transient() {
-        assert!(is_transient(
-            "failed to send transcription request — network error?"
-        ));
-        assert!(is_transient(
-            "Groq API server error (503): service unavailable"
-        ));
-        assert!(is_transient("connection timed out"));
-        assert!(!is_transient("authentication failed (401)"));
-        assert!(!is_transient("rate limited (429)"));
-        assert!(!is_transient("Groq API error (400): bad request"));
+    fn parses_text_from_scribe_response() {
+        assert_eq!(
+            parse_transcription(br#"{"text":"hello world"}"#).unwrap(),
+            "hello world"
+        );
+        assert!(parse_transcription(br#"{"unexpected":"value"}"#).is_err());
+        assert!(parse_transcription(b"not json").is_err());
+    }
+
+    #[test]
+    fn classifies_provider_statuses() {
+        assert_eq!(
+            classify_status(StatusCode::UNAUTHORIZED),
+            StatusClass::Authentication
+        );
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS),
+            StatusClass::RateLimited
+        );
+        assert_eq!(
+            classify_status(StatusCode::BAD_REQUEST),
+            StatusClass::Request
+        );
+        assert_eq!(
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusClass::Server
+        );
+    }
+
+    #[test]
+    fn retries_only_server_statuses() {
+        assert!(is_transient_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_transient_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_transient_status(StatusCode::UNPROCESSABLE_ENTITY));
+    }
+
+    #[test]
+    fn filters_and_limits_keyterms() {
+        let too_long = "a".repeat(MAX_KEYTERM_CHARS + 1);
+        let terms = valid_keyterms(vec![
+            "valid term".to_string(),
+            String::new(),
+            too_long,
+            "one two three four five six".to_string(),
+            "invalid[term".to_string(),
+        ]);
+        assert_eq!(terms, vec!["valid term"]);
+
+        let capped = valid_keyterms((0..MAX_KEYTERMS + 1).map(|n| format!("term{n}")).collect());
+        assert_eq!(capped.len(), MAX_KEYTERMS);
     }
 }

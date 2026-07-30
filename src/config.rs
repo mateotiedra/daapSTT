@@ -1,27 +1,19 @@
 //! Configuration — reads settings from environment variables.
 //!
-//! The primary source is `GROQ_API_KEY` from the environment.
-//! When running as a systemd service, this is injected via
-//! `EnvironmentFile=-%h/.config/voice-daemon/env`.
-//!
-//! For convenience, when running outside systemd (e.g. `cargo run`),
-//! the env file is also loaded automatically if it exists.
+//! `ELEVENLABS_API_KEY` is loaded from the environment. When running as a
+//! systemd service, it is injected via
+//! `EnvironmentFile=-%h/.config/voice-daemon/env`. For convenience, that file
+//! is also loaded for `cargo run` when it exists.
 
 use std::env;
 use std::path::Path;
 
 /// Application configuration.
 pub struct Config {
-    /// Groq API key (required).
-    pub groq_api_key: String,
-    /// Groq API base URL.
-    pub groq_api_url: String,
-    /// Whisper model to use.
-    pub model: String,
-    /// Response format (text or json).
-    pub response_format: String,
-    /// Transcription language.
-    pub language: String,
+    /// ElevenLabs API key (required).
+    pub elevenlabs_api_key: String,
+    /// ElevenLabs Speech-to-Text endpoint.
+    pub elevenlabs_api_url: String,
     /// Marker character typed on recording start.
     pub marker_char: String,
     /// Max recording duration in seconds.
@@ -42,7 +34,7 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if `GROQ_API_KEY` is not set.
+    /// Returns an error if `ELEVENLABS_API_KEY` is not set.
     pub fn from_env() -> anyhow::Result<Self> {
         // When not launched by systemd, try to load the env file automatically
         // so `cargo run` works without manual `export`.
@@ -56,28 +48,22 @@ impl Config {
             }
         }
 
-        let groq_api_key = env::var("GROQ_API_KEY").map_err(|_| {
-            anyhow::anyhow!(
-                "GROQ_API_KEY is not set.\n\
-                \n\
-                To fix this, either:\n\
-                1. Set it inline: GROQ_API_KEY=gsk_... cargo run\n\
-                2. Export it: export GROQ_API_KEY=gsk_...\n\
-                3. Write it to ~/.config/voice-daemon/env (used by systemd and cargo run)\n\
-                \n\
-                Get a free key at https://console.groq.com/keys"
-            )
-        })?;
+        let elevenlabs_api_key = env::var("ELEVENLABS_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ELEVENLABS_API_KEY is not set.\n\
+                    \n\
+                    Add ELEVENLABS_API_KEY=... to ~/.config/voice-daemon/env.\n\
+                    That file is used by systemd and cargo run."
+                )
+            })?;
 
         Ok(Config {
-            groq_api_key,
-            groq_api_url: env::var("GROQ_API_URL").unwrap_or_else(|_| {
-                "https://api.groq.com/openai/v1/audio/transcriptions".to_string()
-            }),
-            model: env::var("GROQ_MODEL").unwrap_or_else(|_| "whisper-large-v3-turbo".to_string()),
-            response_format: env::var("GROQ_RESPONSE_FORMAT")
-                .unwrap_or_else(|_| "text".to_string()),
-            language: env::var("GROQ_LANGUAGE").unwrap_or_else(|_| "en".to_string()),
+            elevenlabs_api_key,
+            elevenlabs_api_url: env::var("ELEVENLABS_API_URL")
+                .unwrap_or_else(|_| "https://api.elevenlabs.io/v1/speech-to-text".to_string()),
             marker_char: env::var("VOICE_MARKER_CHAR").unwrap_or_else(|_| "§".to_string()),
             max_recording_secs: env::var("VOICE_MAX_RECORDING_SECS")
                 .ok()

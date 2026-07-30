@@ -5,7 +5,7 @@
 //!
 //! # WAV Construction
 //!
-//! Groq's Whisper API accepts WAV format. Rather than relying on pw-record's
+//! ElevenLabs Scribe accepts WAV format. Rather than relying on pw-record's
 //! container format (which uses a PipeWire-specific header rather than standard
 //! WAV), we capture raw PCM and prepend a 44-byte WAV header ourselves.
 
