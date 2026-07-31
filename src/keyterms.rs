@@ -4,7 +4,8 @@ use anyhow::{bail, Context, Result};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
-    execute,
+    execute, queue,
+    style::Print,
     terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
@@ -216,22 +217,28 @@ impl Drop for TerminalGuard {
 }
 
 fn render(stdout: &mut impl Write, terms: &[String], selected: usize) -> Result<()> {
-    execute!(
+    queue!(
         stdout,
         terminal::Clear(ClearType::All),
-        cursor::MoveTo(0, 0)
+        cursor::MoveTo(0, 0),
+        Print(format!("Keyterms ({} of {MAX_TERMS})", terms.len())),
+        cursor::MoveTo(0, 1),
+        Print("↑/↓ or j/k: move   D: delete   q/Esc: exit")
     )?;
-    write!(stdout, "Keyterms ({} of {MAX_TERMS})\r\n", terms.len())?;
-    write!(stdout, "↑/↓ or j/k: move   D: delete   q/Esc: exit\r\n")?;
     if terms.is_empty() {
-        write!(
+        queue!(
             stdout,
-            "\r\n(no keyterms; add one with: daapstt keyterms add <term>)\r\n"
+            cursor::MoveTo(0, 3),
+            Print("(no keyterms; add one with: daapstt keyterms add <term>)")
         )?;
     } else {
         for (index, term) in terms.iter().enumerate() {
             let marker = if index == selected { ">" } else { " " };
-            write!(stdout, "{marker} {}\r\n", display_term(term))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(0, index as u16 + 2),
+                Print(format!("{marker} {}", display_term(term)))
+            )?;
         }
     }
     stdout.flush()?;
@@ -239,10 +246,10 @@ fn render(stdout: &mut impl Write, terms: &[String], selected: usize) -> Result<
 }
 
 fn confirm_delete(stdout: &mut impl Write, term: &str) -> Result<bool> {
-    writeln!(
+    execute!(
         stdout,
-        "\nDelete \"{}\"? y to confirm: ",
-        display_term(term)
+        cursor::MoveToNextLine(2),
+        Print(format!("Delete \"{}\"? y to confirm: ", display_term(term)))
     )?;
     stdout.flush()?;
     loop {
@@ -347,11 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn render_uses_carriage_returns_in_raw_mode() {
+    fn render_positions_each_row_at_the_left_edge() {
         let mut output = Vec::new();
         render(&mut output, &["pi".to_string(), "mateo".to_string()], 0).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Keyterms (2 of 1000)\r\n↑/↓ or j/k: move   D: delete   q/Esc: exit\r\n> pi\r\n  mateo\r\n"));
+        assert!(output.contains("\x1b[1;1HKeyterms (2 of 1000)"));
+        assert!(output.contains("\x1b[2;1H↑/↓ or j/k: move"));
+        assert!(output.contains("\x1b[3;1H> pi"));
+        assert!(output.contains("\x1b[4;1H  mateo"));
     }
 
     #[test]
