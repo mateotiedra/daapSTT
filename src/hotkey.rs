@@ -1,8 +1,8 @@
 //! Hotkey detection via evdev.
 //!
-//! Monitors all keyboard devices in `/dev/input/event*` for
-//! Alt+Space press and release events. Sends events through
-//! a tokio channel to the orchestrator.
+//! Monitors all keyboard devices in `/dev/input/event*` for F24 press
+//! and release events. Sends events through a tokio channel to the
+//! orchestrator.
 //!
 //! # Architecture
 //!
@@ -10,11 +10,9 @@
 //!   new keyboard devices and managing per-device reader threads.
 //! - Each keyboard device gets a `spawn_blocking` thread that reads
 //!   events via evdev's blocking API.
-//! - Raw key events are sent through an mpsc channel to a state machine
-//!   that tracks Alt+Space combo state across all devices.
-//! - The state machine emits `HotkeyEvent::Press` when Alt is down and
-//!   Space is pressed, and `HotkeyEvent::Release` when either key is
-//!   released while recording.
+//! - Raw key events are sent through an mpsc channel to a state machine.
+//! - The state machine emits `HotkeyEvent::Press` and `HotkeyEvent::Release`
+//!   for F24 down and up, respectively.
 
 use anyhow::Result;
 use evdev::{Device, InputEventKind, Key};
@@ -37,16 +35,59 @@ pub enum HotkeyEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RawEvent {
-    AltDown,
-    AltUp,
-    SpaceDown,
-    SpaceUp,
+    F24Down,
+    F24Up,
 }
 
-/// Start monitoring keyboard devices for Alt+Space events.
+const COOLDOWN_DURATION: Duration = Duration::from_millis(200);
+
+/// State for the modifier-free F24 hotkey.
+#[derive(Default)]
+struct HotkeyState {
+    f24_pressed: bool,
+    recording: bool,
+    cooldown_until: Option<Instant>,
+}
+
+impl HotkeyState {
+    /// Processes an event, ignoring repeats and duplicate transitions.
+    fn process(&mut self, event: RawEvent, now: Instant) -> Option<HotkeyEvent> {
+        match event {
+            RawEvent::F24Down => {
+                if self.f24_pressed {
+                    return None;
+                }
+                self.f24_pressed = true;
+
+                if self.recording || self.cooldown_until.is_some_and(|until| now < until) {
+                    None
+                } else {
+                    self.recording = true;
+                    self.cooldown_until = None;
+                    Some(HotkeyEvent::Press)
+                }
+            }
+            RawEvent::F24Up => {
+                if !self.f24_pressed {
+                    return None;
+                }
+                self.f24_pressed = false;
+
+                if self.recording {
+                    self.recording = false;
+                    self.cooldown_until = Some(now + COOLDOWN_DURATION);
+                    Some(HotkeyEvent::Release)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Start monitoring keyboard devices for F24 events.
 ///
-/// Sends `HotkeyEvent::Press` when Alt+Space is pressed (both keys down)
-/// and `HotkeyEvent::Release` when either key is released while recording.
+/// Sends `HotkeyEvent::Press` on F24 down and `HotkeyEvent::Release` on F24 up.
 ///
 /// The `shutdown` Notify is triggered by the caller to signal graceful
 /// shutdown — the state machine and manager use it to exit cleanly.
@@ -127,13 +168,8 @@ pub async fn run(tx: mpsc::Sender<HotkeyEvent>, shutdown: Arc<Notify>) -> Result
     // Also listens for the external shutdown signal to exit cleanly.
     let state_shutdown = shutdown.clone();
     let state_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
-        // Cooldown period after Release to suppress duplicate events from
-        // virtual keyboard devices (e.g., keyd) that mirror physical key presses.
-        let cooldown_duration = Duration::from_millis(200);
-        let mut cooldown_until: Option<Instant> = None;
-        let mut alt_pressed = false;
-        let mut space_pressed = false;
-        let mut recording = false;
+        // Suppress mirrored F24 sequences from duplicate virtual keyboard devices.
+        let mut state = HotkeyState::default();
 
         loop {
             let event = tokio::select! {
@@ -150,69 +186,10 @@ pub async fn run(tx: mpsc::Sender<HotkeyEvent>, shutdown: Arc<Notify>) -> Result
                 break;
             };
 
-            let now = Instant::now();
-            let in_cooldown = cooldown_until.map_or(false, |t| now < t);
-
-            // Update state based on raw key events
-            match event {
-                RawEvent::AltDown => {
-                    debug!("Alt pressed");
-                    if space_pressed && !recording && !in_cooldown {
-                        debug!("Space+Alt pressed → Press");
-                        if tx.send(HotkeyEvent::Press).await.is_err() {
-                            break;
-                        }
-                        recording = true;
-                        cooldown_until = None; // clear cooldown on new recording
-                    }
-                    alt_pressed = true;
-                }
-                RawEvent::AltUp => {
-                    debug!("Alt released");
-                    if recording {
-                        debug!("Alt released while recording → Release");
-                        if tx.send(HotkeyEvent::Release).await.is_err() {
-                            break; // channel closed
-                        }
-                        recording = false;
-                        cooldown_until = Some(now + cooldown_duration);
-                    }
-                    alt_pressed = false;
-                }
-                RawEvent::SpaceDown => {
-                    debug!("Space pressed");
-                    if alt_pressed && !recording && !in_cooldown {
-                        debug!("Alt+Space pressed → Press");
-                        if tx.send(HotkeyEvent::Press).await.is_err() {
-                            break;
-                        }
-                        recording = true;
-                        cooldown_until = None; // clear cooldown on new recording
-                    }
-                    space_pressed = true;
-                }
-                RawEvent::SpaceUp => {
-                    debug!("Space released");
-                    if recording {
-                        debug!("Space released while recording → Release");
-                        if tx.send(HotkeyEvent::Release).await.is_err() {
-                            break;
-                        }
-                        recording = false;
-                        cooldown_until = Some(now + cooldown_duration);
-                    }
-                    space_pressed = false;
-                }
-            }
-
-            // Sanity check: if recording but neither alt nor space is pressed,
-            // we missed a release event — emit Release to recover
-            if recording && !alt_pressed && !space_pressed {
-                warn!("state inconsistency: recording but no keys held — emitting Release");
-                if tx.send(HotkeyEvent::Release).await.is_err() {
+            if let Some(hotkey_event) = state.process(event, Instant::now()) {
+                if tx.send(hotkey_event).await.is_err() {
                     break;
                 }
-                recording = false;
             }
         }
 
@@ -238,17 +215,15 @@ struct KeyboardInfo {
 
 /// Find all keyboard devices in /dev/input/.
 ///
-/// Detects keyboards by checking if the device supports KEY_SPACE.
+/// Detects keyboards by checking if the device supports KEY_F24.
 fn find_keyboards() -> Result<Vec<KeyboardInfo>> {
     let mut keyboards = Vec::new();
 
     for (path, device) in evdev::enumerate() {
         // Check if this device supports keyboard keys
         if let Some(keys) = device.supported_keys() {
-            if keys.contains(Key::KEY_SPACE) {
-                keyboards.push(KeyboardInfo {
-                    path: std::path::PathBuf::from(path),
-                });
+            if keys.contains(Key::KEY_F24) {
+                keyboards.push(KeyboardInfo { path });
             }
         }
     }
@@ -256,10 +231,19 @@ fn find_keyboards() -> Result<Vec<KeyboardInfo>> {
     Ok(keyboards)
 }
 
+/// Converts the relevant non-repeat evdev key transitions to raw events.
+fn raw_event(key: Key, value: i32) -> Option<RawEvent> {
+    match (key, value) {
+        (Key::KEY_F24, 1) => Some(RawEvent::F24Down),
+        (Key::KEY_F24, 0) => Some(RawEvent::F24Up),
+        _ => None,
+    }
+}
+
 /// Read keyboard events from a single device in a blocking loop.
 ///
 /// Runs in `spawn_blocking`. Sends `RawEvent` messages for relevant
-/// key presses/releases (Alt and Space).
+/// F24 presses/releases.
 fn read_keyboard_events(path: &std::path::Path, tx: mpsc::Sender<RawEvent>) {
     // Try to open the device — if it fails, just return
     let mut device = loop {
@@ -303,22 +287,9 @@ fn read_keyboard_events(path: &std::path::Path, tx: mpsc::Sender<RawEvent>) {
                         continue;
                     };
 
-                    let send = match key {
-                        Key::KEY_LEFTALT | Key::KEY_RIGHTALT => match ev.value() {
-                            1 => Some(RawEvent::AltDown),
-                            0 => Some(RawEvent::AltUp),
-                            _ => None, // repeat — ignore
-                        },
-                        Key::KEY_SPACE => match ev.value() {
-                            1 => Some(RawEvent::SpaceDown),
-                            0 => Some(RawEvent::SpaceUp),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
+                    let send = raw_event(key, ev.value());
 
                     if let Some(raw_event) = send {
-                        debug!("device {path:?}: {raw_event:?}");
                         if tx.blocking_send(raw_event).is_err() {
                             info!("channel closed, exiting device reader for {path:?}");
                             return;
@@ -340,5 +311,101 @@ fn read_keyboard_events(path: &std::path::Path, tx: mpsc::Sender<RawEvent>) {
         // Small sleep to avoid busy-waiting when no events are available
         // fetch_events() returns immediately, so we yield the CPU
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn time() -> Instant {
+        Instant::now()
+    }
+
+    #[test]
+    fn normal_hold_and_release() {
+        let now = time();
+        let mut state = HotkeyState::default();
+
+        assert_eq!(
+            state.process(RawEvent::F24Down, now),
+            Some(HotkeyEvent::Press)
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Up, now),
+            Some(HotkeyEvent::Release)
+        );
+    }
+
+    #[test]
+    fn repeats_and_duplicate_transitions_are_ignored() {
+        let now = time();
+        let mut state = HotkeyState::default();
+
+        assert_eq!(raw_event(Key::KEY_F24, 2), None);
+        assert_eq!(
+            state.process(RawEvent::F24Down, now),
+            Some(HotkeyEvent::Press)
+        );
+        assert_eq!(state.process(RawEvent::F24Down, now), None);
+        assert_eq!(
+            state.process(RawEvent::F24Up, now),
+            Some(HotkeyEvent::Release)
+        );
+        assert_eq!(state.process(RawEvent::F24Up, now), None);
+    }
+
+    #[test]
+    fn cooldown_suppresses_mirrored_sequence_then_retriggers() {
+        let now = time();
+        let mut state = HotkeyState::default();
+
+        assert_eq!(
+            state.process(RawEvent::F24Down, now),
+            Some(HotkeyEvent::Press)
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Up, now),
+            Some(HotkeyEvent::Release)
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Down, now + Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Up, now + Duration::from_millis(101)),
+            None
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Down, now + COOLDOWN_DURATION),
+            Some(HotkeyEvent::Press)
+        );
+    }
+
+    #[test]
+    fn release_recovers_after_suppressed_press() {
+        let now = time();
+        let mut state = HotkeyState::default();
+
+        assert_eq!(
+            state.process(RawEvent::F24Down, now),
+            Some(HotkeyEvent::Press)
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Up, now),
+            Some(HotkeyEvent::Release)
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Down, now + Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Up, now + Duration::from_millis(2)),
+            None
+        );
+        assert_eq!(
+            state.process(RawEvent::F24Down, now + COOLDOWN_DURATION),
+            Some(HotkeyEvent::Press)
+        );
     }
 }

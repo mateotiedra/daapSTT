@@ -14,7 +14,7 @@ use log::{debug, info, warn};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc::UnboundedSender, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
@@ -152,9 +152,14 @@ impl RecordingHandle {
 ///
 /// Recording is automatically stopped after `max_duration` via a
 /// timeout that runs in the caller's context.
+///
+/// When `pcm_sender` is `Some`, each raw PCM chunk is also sent to it without
+/// blocking the drain task. The recording always retains its own complete PCM
+/// buffer; if the receiver is dropped, fan-out is disabled and capture continues.
 pub fn start_recording(
     _max_duration: Duration,
     record_target: Option<&str>,
+    pcm_sender: Option<UnboundedSender<Vec<u8>>>,
 ) -> Result<RecordingHandle> {
     if let Some(target) = record_target {
         info!("starting pw-record (raw PCM, 16kHz, mono, s16le, target: {target})");
@@ -195,11 +200,12 @@ pub fn start_recording(
 
     let drain_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
+        let mut pcm_sender = pcm_sender;
         loop {
             match stdout.read(&mut buf).await {
                 Ok(0) => break, // pipe closed — pw-record exited
                 Ok(n) => {
-                    raw_pcm_clone.lock().await.extend_from_slice(&buf[..n]);
+                    fan_out_pcm_chunk(&raw_pcm_clone, &mut pcm_sender, &buf[..n]).await;
                 }
                 Err(e) => {
                     warn!("error reading pw-record stdout: {e}");
@@ -214,6 +220,25 @@ pub fn start_recording(
         raw_pcm,
         drain_handle,
     })
+}
+
+/// Append a captured chunk locally, then optionally fan it out to a consumer.
+///
+/// An unbounded sender keeps this operation non-blocking. A dropped receiver
+/// only disables future fan-out; it never affects local recording capture.
+async fn fan_out_pcm_chunk(
+    raw_pcm: &Arc<Mutex<Vec<u8>>>,
+    pcm_sender: &mut Option<UnboundedSender<Vec<u8>>>,
+    chunk: &[u8],
+) {
+    raw_pcm.lock().await.extend_from_slice(chunk);
+
+    if let Some(sender) = pcm_sender {
+        if sender.send(chunk.to_vec()).is_err() {
+            debug!("raw PCM fan-out receiver dropped; continuing local capture");
+            *pcm_sender = None;
+        }
+    }
 }
 
 /// Build a standard WAV file from raw 16-bit signed little-endian PCM data.
@@ -302,6 +327,34 @@ fn save_debug_wav(wav_data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_fan_out_appends_locally_and_sends_chunk() {
+        let raw_pcm = Arc::new(Mutex::new(Vec::new()));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pcm_sender = Some(sender);
+        let chunk = [1, 2, 3, 4];
+
+        fan_out_pcm_chunk(&raw_pcm, &mut pcm_sender, &chunk).await;
+
+        assert_eq!(*raw_pcm.lock().await, chunk);
+        assert_eq!(receiver.try_recv().unwrap(), chunk);
+        assert!(pcm_sender.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_continues_locally_after_receiver_loss() {
+        let raw_pcm = Arc::new(Mutex::new(Vec::new()));
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        let mut pcm_sender = Some(sender);
+
+        fan_out_pcm_chunk(&raw_pcm, &mut pcm_sender, &[1, 2]).await;
+        fan_out_pcm_chunk(&raw_pcm, &mut pcm_sender, &[3, 4]).await;
+
+        assert_eq!(*raw_pcm.lock().await, [1, 2, 3, 4]);
+        assert!(pcm_sender.is_none());
+    }
 
     #[test]
     fn test_build_wav_header() {

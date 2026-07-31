@@ -86,6 +86,61 @@ pub async fn backspace_marker() -> Result<()> {
     Ok(())
 }
 
+/// Apply one realtime-tail replacement edit.
+///
+/// Backspaces and replacement text are sent through one `wtype` invocation so
+/// their order is preserved. `backspaces` must count user-visible graphemes,
+/// not bytes or Unicode scalar values.
+pub async fn apply_realtime_edit(backspaces: usize, text: &str) -> Result<()> {
+    if backspaces == 0 && text.is_empty() {
+        return Ok(());
+    }
+
+    debug!(
+        "applying realtime edit: {backspaces} backspaces, {} bytes inserted",
+        text.len()
+    );
+
+    let mut command = Command::new("wtype");
+    for _ in 0..backspaces {
+        command.arg("-k").arg("backspace");
+    }
+    if text.is_empty() {
+        command.stdin(std::process::Stdio::null());
+    } else {
+        command.arg("-").stdin(std::process::Stdio::piped());
+    }
+
+    let mut output = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn wtype for realtime edit")?;
+
+    if !text.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut stdin) = output.stdin.take() {
+            stdin
+                .write_all(text.as_bytes())
+                .await
+                .context("failed to write realtime edit text to wtype stdin")?;
+        }
+    }
+
+    let status = output
+        .wait_with_output()
+        .await
+        .context("failed to wait for wtype realtime edit")?;
+
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        warn!("wtype realtime edit failed: {stderr}");
+        return Err(anyhow::anyhow!("wtype realtime edit failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
 /// Type the transcribed text into the active window.
 ///
 /// Pipes the text through wtype's stdin to avoid shell escaping issues

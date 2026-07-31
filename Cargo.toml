@@ -14,12 +14,22 @@ reqwest = { version = "0.12", features = ["multipart", "json"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
+url = "2"
+
+# ElevenLabs realtime WebSocket transport
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Keyboard input via evdev
 evdev = "0.12"
 
 # XDG paths
 dirs = "5"
+
+# Unicode-safe realtime tail editing
+unicode-segmentation = "1.12"
 
 # Error handling
 anyhow = "1"

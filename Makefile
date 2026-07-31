@@ -32,7 +32,8 @@ run:
 install: build
 	@echo "Installing $(BIN_NAME)..."
 	@mkdir -p $(BIN_DIR)
-	cp target/release/$(BIN_NAME) $(BIN_DIR)/$(BIN_NAME)
+	install -m 755 target/release/$(BIN_NAME) $(BIN_DIR)/.$(BIN_NAME).new
+	mv -f $(BIN_DIR)/.$(BIN_NAME).new $(BIN_DIR)/$(BIN_NAME)
 	@echo "  → $(BIN_DIR)/$(BIN_NAME)"
 	@mkdir -p $(SERVICE_DIR)
 	cp contrib/voice-daemon.service $(SERVICE_DIR)/voice-daemon.service

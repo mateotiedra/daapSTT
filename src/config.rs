@@ -14,6 +14,8 @@ pub struct Config {
     pub elevenlabs_api_key: String,
     /// ElevenLabs Speech-to-Text endpoint.
     pub elevenlabs_api_url: String,
+    /// ElevenLabs Scribe realtime WebSocket endpoint.
+    pub elevenlabs_realtime_url: String,
     /// Marker character typed on recording start.
     pub marker_char: String,
     /// Max recording duration in seconds.
@@ -64,6 +66,9 @@ impl Config {
             elevenlabs_api_key,
             elevenlabs_api_url: env::var("ELEVENLABS_API_URL")
                 .unwrap_or_else(|_| "https://api.elevenlabs.io/v1/speech-to-text".to_string()),
+            elevenlabs_realtime_url: env::var("ELEVENLABS_REALTIME_URL").unwrap_or_else(|_| {
+                "wss://api.elevenlabs.io/v1/speech-to-text/realtime".to_string()
+            }),
             marker_char: env::var("VOICE_MARKER_CHAR").unwrap_or_else(|_| "§".to_string()),
             max_recording_secs: env::var("VOICE_MAX_RECORDING_SECS")
                 .ok()
