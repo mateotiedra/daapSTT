@@ -221,17 +221,17 @@ fn render(stdout: &mut impl Write, terms: &[String], selected: usize) -> Result<
         terminal::Clear(ClearType::All),
         cursor::MoveTo(0, 0)
     )?;
-    writeln!(stdout, "Keyterms ({} of {MAX_TERMS})", terms.len())?;
-    writeln!(stdout, "↑/↓ or j/k: move   D: delete   q/Esc: exit")?;
+    write!(stdout, "Keyterms ({} of {MAX_TERMS})\r\n", terms.len())?;
+    write!(stdout, "↑/↓ or j/k: move   D: delete   q/Esc: exit\r\n")?;
     if terms.is_empty() {
-        writeln!(
+        write!(
             stdout,
-            "\n(no keyterms; add one with: daapstt keyterms add <term>)"
+            "\r\n(no keyterms; add one with: daapstt keyterms add <term>)\r\n"
         )?;
     } else {
         for (index, term) in terms.iter().enumerate() {
             let marker = if index == selected { ">" } else { " " };
-            writeln!(stdout, "{marker} {}", display_term(term))?;
+            write!(stdout, "{marker} {}\r\n", display_term(term))?;
         }
     }
     stdout.flush()?;
@@ -344,6 +344,14 @@ mod tests {
         assert_eq!(move_selection(0, 0, 1), 0);
         assert_eq!(move_selection(0, 3, -1), 2);
         assert_eq!(move_selection(2, 3, 1), 0);
+    }
+
+    #[test]
+    fn render_uses_carriage_returns_in_raw_mode() {
+        let mut output = Vec::new();
+        render(&mut output, &["pi".to_string(), "mateo".to_string()], 0).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Keyterms (2 of 1000)\r\n↑/↓ or j/k: move   D: delete   q/Esc: exit\r\n> pi\r\n  mateo\r\n"));
     }
 
     #[test]
