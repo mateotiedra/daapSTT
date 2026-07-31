@@ -9,7 +9,7 @@ fn endpoint_has_required_query_and_encoded_repeated_keyterms() {
     .unwrap();
     assert_eq!(
         url.as_str(),
-        "wss://api.example.test/realtime?existing=yes&model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=vad&keyterms=alpha+beta&keyterms=C%2B%2B%2FRust"
+        "wss://api.example.test/realtime?existing=yes&model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=vad&no_verbatim=true&keyterms=alpha+beta&keyterms=C%2B%2B%2FRust"
     );
 }
 

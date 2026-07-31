@@ -64,7 +64,7 @@ journalctl --user -u voice-daemon -f
 
 Batch transcription is the default. In both Batch and Realtime modes, the user hotkey remains **hold Alt+Space and release it to stop**. `F24` is only keyd's internal normalized signal; it is not a second user-facing hotkey.
 
-Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak:
+Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds:
 
 ```bash
 daapstt realtime on      # Enable realtime and restart the user service

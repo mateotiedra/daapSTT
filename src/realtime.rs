@@ -170,6 +170,7 @@ pub fn build_realtime_url(endpoint: &str, keyterms: &[String]) -> Result<Url, Re
     query.append_pair("model_id", "scribe_v2_realtime");
     query.append_pair("audio_format", "pcm_16000");
     query.append_pair("commit_strategy", "vad");
+    query.append_pair("no_verbatim", "true");
     for keyterm in keyterms.iter().take(MAX_KEYTERMS) {
         query.append_pair("keyterms", keyterm);
     }
