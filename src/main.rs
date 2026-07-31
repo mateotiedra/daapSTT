@@ -140,18 +140,21 @@ async fn main() -> Result<()> {
 fn run_command(command: String, args: impl Iterator<Item = String>) -> Result<()> {
     let args = args.collect::<Vec<_>>();
     match command.as_str() {
-        "keyterms" => match args.as_slice() {
-            [] => keyterms::interactive(),
-            [subcommand] if subcommand == "list" => {
-                for term in keyterms::load()? {
-                    println!("{term}");
+        "keyterms" => {
+            let path = config::keyterms_path();
+            match args.as_slice() {
+                [] => keyterms::interactive(&path),
+                [subcommand] if subcommand == "list" => {
+                    for term in keyterms::load(&path)? {
+                        println!("{term}");
+                    }
+                    Ok(())
                 }
-                Ok(())
+                [subcommand, term] if subcommand == "add" => keyterms::add(&path, term),
+                [subcommand, term] if subcommand == "remove" => keyterms::remove(&path, term),
+                _ => anyhow::bail!("invalid keyterms command\n\n{}", usage()),
             }
-            [subcommand, term] if subcommand == "add" => keyterms::add(term),
-            [subcommand, term] if subcommand == "remove" => keyterms::remove(term),
-            _ => anyhow::bail!("invalid keyterms command\n\n{}", usage()),
-        },
+        }
         "realtime" => match parse_realtime_command(&args)? {
             RealtimeCommand::On => mode::set_and_restart(mode::Mode::Realtime),
             RealtimeCommand::Off => mode::set_and_restart(mode::Mode::Batch),

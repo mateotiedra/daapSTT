@@ -50,7 +50,9 @@ pub async fn transcribe(config: &Config, audio: &[u8]) -> Result<String> {
 
     // Keyterms are intentionally loaded for every request so edits take effect
     // without restarting the daemon.
-    let keyterms = valid_keyterms(crate::keyterms::load().context("failed to load keyterms")?);
+    let keyterms = valid_keyterms(
+        crate::keyterms::load(&config.keyterms_path).context("failed to load keyterms")?,
+    );
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {

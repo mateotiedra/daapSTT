@@ -61,7 +61,7 @@ pub(crate) async fn handle_realtime_press(
             }
         };
 
-    let realtime_config = match keyterms::load() {
+    let realtime_config = match keyterms::load(&config.keyterms_path) {
         Ok(keyterms) => realtime::RealtimeConfig {
             endpoint: config.elevenlabs_realtime_url.clone(),
             api_key: config.elevenlabs_api_key.clone(),

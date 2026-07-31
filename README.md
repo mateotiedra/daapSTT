@@ -80,7 +80,7 @@ If realtime fails before any committed text appears, the provisional partial is 
 
 ## Keyterms
 
-Keyterms help Scribe recognize names, product names, and other specialized vocabulary. They are stored locally in `~/.config/voice-daemon/keyterms.txt`, one trimmed phrase per line. Empty lines are ignored; terms are case-sensitive, deduplicated in insertion order, limited to 1,000 entries, and each term may contain at most 50 Unicode characters and five words. ElevenLabs does not accept `<`, `>`, `{`, `}`, `[`, `]`, or `\` in a term.
+Keyterms help Scribe recognize names, product names, and other specialized vocabulary. By default, they are stored locally in `~/.config/voice-daemon/keyterms.txt`; set `VOICE_KEYTERMS_FILE` in the env file to use a different file. The keyterms file contains one trimmed phrase per line. Empty lines are ignored; terms are case-sensitive, deduplicated in insertion order, limited to 1,000 entries, and each term may contain at most 50 Unicode characters and five words. ElevenLabs does not accept `<`, `>`, `{`, `}`, `[`, `]`, or `\` in a term.
 
 Manage them from an interactive terminal (not from the background daemon):
 
@@ -113,6 +113,7 @@ Set these variables in `~/.config/voice-daemon/env`:
 | `ELEVENLABS_REALTIME_URL` | `wss://api.elevenlabs.io/v1/speech-to-text/realtime` | Realtime WebSocket endpoint (normally leave unchanged) |
 | `VOICE_MARKER_CHAR` | `§` | Recording indicator character |
 | `VOICE_MAX_RECORDING_SECS` | `60` | Maximum recording duration |
+| `VOICE_KEYTERMS_FILE` | `~/.config/voice-daemon/keyterms.txt` | File containing one keyterm per line; keyterm commands use this path |
 
 ## Architecture
 

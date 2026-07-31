@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     process,
 };
 
@@ -20,17 +20,17 @@ const MAX_TERMS: usize = 1_000;
 const MAX_TERM_CHARS: usize = 50;
 const MAX_TERM_WORDS: usize = 5;
 
-/// Load keyterms from `~/.config/voice-daemon/keyterms.txt`.
-pub fn load() -> Result<Vec<String>> {
-    load_from_path(&path())
+/// Load keyterms from `path`.
+pub fn load(path: &Path) -> Result<Vec<String>> {
+    load_from_path(path)
 }
 
-pub(crate) fn add(term: &str) -> Result<()> {
-    add_to_path(&path(), term)
+pub(crate) fn add(path: &Path, term: &str) -> Result<()> {
+    add_to_path(path, term)
 }
 
-pub(crate) fn remove(term: &str) -> Result<()> {
-    remove_from_path(&path(), term)
+pub(crate) fn remove(path: &Path, term: &str) -> Result<()> {
+    remove_from_path(path, term)
 }
 
 fn add_to_path(path: &Path, term: &str) -> Result<()> {
@@ -56,8 +56,8 @@ fn remove_from_path(path: &Path, term: &str) -> Result<()> {
     write_to_path(path, &terms)
 }
 
-pub(crate) fn interactive() -> Result<()> {
-    let mut terms = load()?;
+pub(crate) fn interactive(path: &Path) -> Result<()> {
+    let mut terms = load(path)?;
     let mut selected = 0;
     let mut terminal_guard = TerminalGuard::new()?;
     let mut stdout = terminal_guard.stdout();
@@ -82,20 +82,13 @@ pub(crate) fn interactive() -> Result<()> {
                 let term = terms[selected].clone();
                 if confirm_delete(&mut stdout, &term)? {
                     terms.remove(selected);
-                    write_to_path(&path(), &terms)?;
+                    write_to_path(path, &terms)?;
                     selected = selected.min(terms.len().saturating_sub(1));
                 }
             }
             _ => {}
         }
     }
-}
-
-fn path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("voice-daemon")
-        .join("keyterms.txt")
 }
 
 fn load_from_path(path: &Path) -> Result<Vec<String>> {
@@ -284,7 +277,10 @@ fn move_selection(selected: usize, len: usize, direction: i8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn test_path() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -322,16 +318,16 @@ mod tests {
     }
 
     #[test]
-    fn mutations_persist_and_missing_files_are_empty() {
+    fn configured_path_mutations_persist_and_missing_files_are_empty() {
         let path = test_path().join("keyterms.txt");
-        assert!(load_from_path(&path).unwrap().is_empty());
-        add_to_path(&path, "first").unwrap();
-        add_to_path(&path, "second").unwrap();
-        assert!(add_to_path(&path, "first").is_err());
-        assert_eq!(load_from_path(&path).unwrap(), ["first", "second"]);
-        remove_from_path(&path, "first").unwrap();
-        assert!(remove_from_path(&path, "missing").is_err());
-        assert_eq!(load_from_path(&path).unwrap(), ["second"]);
+        assert!(load(&path).unwrap().is_empty());
+        add(&path, "first").unwrap();
+        add(&path, "second").unwrap();
+        assert!(add(&path, "first").is_err());
+        assert_eq!(load(&path).unwrap(), ["first", "second"]);
+        remove(&path, "first").unwrap();
+        assert!(remove(&path, "missing").is_err());
+        assert_eq!(load(&path).unwrap(), ["second"]);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

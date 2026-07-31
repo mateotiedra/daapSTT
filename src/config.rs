@@ -6,7 +6,7 @@
 //! is also loaded for `cargo run` when it exists.
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Application configuration.
 pub struct Config {
@@ -26,6 +26,8 @@ pub struct Config {
     /// Whether to pause media players (via playerctl) when recording starts.
     /// When enabled, media is paused on hotkey press and resumed on release.
     pub pause_media: bool,
+    /// File containing one keyterm per line.
+    pub keyterms_path: PathBuf,
 }
 
 impl Config {
@@ -38,17 +40,7 @@ impl Config {
     ///
     /// Returns an error if `ELEVENLABS_API_KEY` is not set.
     pub fn from_env() -> anyhow::Result<Self> {
-        // When not launched by systemd, try to load the env file automatically
-        // so `cargo run` works without manual `export`.
-        if env::var("INVOCATION_ID").is_err() {
-            let env_path = dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("voice-daemon")
-                .join("env");
-            if env_path.exists() {
-                load_env_file(&env_path);
-            }
-        }
+        load_env_file_if_present();
 
         let elevenlabs_api_key = env::var("ELEVENLABS_API_KEY")
             .ok()
@@ -79,7 +71,42 @@ impl Config {
                 .ok()
                 .map(|v| v.to_lowercase() != "false" && v != "0")
                 .unwrap_or(true),
+            keyterms_path: keyterms_path_from_env(),
         })
+    }
+}
+
+/// Returns the configured keyterms file, sourcing the env file when needed.
+///
+/// An unset or blank `VOICE_KEYTERMS_FILE` uses the legacy default path.
+pub fn keyterms_path() -> PathBuf {
+    load_env_file_if_present();
+    keyterms_path_from_env()
+}
+
+fn keyterms_path_from_env() -> PathBuf {
+    let value = env::var("VOICE_KEYTERMS_FILE").ok();
+    keyterms_path_from(value.as_deref())
+}
+
+fn default_keyterms_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("voice-daemon")
+        .join("keyterms.txt")
+}
+
+fn load_env_file_if_present() {
+    // When not launched by systemd, try to load the env file automatically
+    // so `cargo run` and keyterms commands work without manual `export`.
+    if env::var("INVOCATION_ID").is_err() {
+        let env_path = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("voice-daemon")
+            .join("env");
+        if env_path.exists() {
+            load_env_file(&env_path);
+        }
     }
 }
 
@@ -108,4 +135,30 @@ fn load_env_file(path: &Path) {
             env::set_var(key, value);
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_keyterms_path_overrides_the_default() {
+        assert_eq!(
+            keyterms_path_from(Some("/tmp/keyterms.txt")),
+            PathBuf::from("/tmp/keyterms.txt")
+        );
+    }
+
+    #[test]
+    fn blank_keyterms_path_uses_the_default() {
+        assert_eq!(keyterms_path_from(None), default_keyterms_path());
+        assert_eq!(keyterms_path_from(Some("  \t")), default_keyterms_path());
+    }
+}
+
+fn keyterms_path_from(value: Option<&str>) -> PathBuf {
+    value
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_keyterms_path)
 }
