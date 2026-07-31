@@ -70,7 +70,7 @@ pub async fn transcribe(config: &Config, audio: &[u8]) -> Result<String> {
         {
             Ok(text) => {
                 info!("transcription successful");
-                return Ok(text.trim().to_string());
+                return Ok(crate::transcript::clean(&text));
             }
             Err(AttemptError::Transport(error)) if is_transient_transport(&error) => {
                 if attempt < MAX_RETRIES {

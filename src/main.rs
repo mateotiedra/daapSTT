@@ -12,6 +12,7 @@ mod notify;
 mod realtime;
 mod realtime_mode;
 mod transcribe;
+mod transcript;
 
 use anyhow::Result;
 use log::{error, info, warn};

@@ -184,12 +184,14 @@ async fn process_realtime_event(
         }
         realtime::RealtimeEvent::PartialTranscript(text) => {
             if failed.is_none() {
-                apply_live_text(state, live_text, text.trim(), false, failed, tail_safe).await;
+                let text = crate::transcript::clean(&text);
+                apply_live_text(state, live_text, &text, false, failed, tail_safe).await;
             }
         }
         realtime::RealtimeEvent::CommittedTranscript(text) => {
             if failed.is_none() {
-                apply_live_text(state, live_text, text.trim(), true, failed, tail_safe).await;
+                let text = crate::transcript::clean(&text);
+                apply_live_text(state, live_text, &text, true, failed, tail_safe).await;
             }
         }
     }

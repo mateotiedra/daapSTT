@@ -72,6 +72,8 @@ daapstt realtime off     # Return to batch mode and restart the service
 daapstt realtime status  # Print Batch or Realtime
 ```
 
+Both Batch and Realtime transcripts remove boundary ASCII/smart double quotes and terminal ellipses. Internal punctuation and normal terminal periods remain unchanged.
+
 In Realtime mode, the current partial transcript is mutable: revisions replace only its changed suffix, while committed segments become immutable. Keep the cursor and window focus where dictation started until releasing the hotkey; moving either during dictation can revise text in the wrong location.
 
 If realtime fails before any committed text appears, the provisional partial is removed and the buffered recording falls back to batch transcription after release. If it fails after a commit, the mutable tail is removed, committed text is kept, and the recording is not batch-transcribed again, avoiding duplicate output. Batch mode behavior is unchanged.
