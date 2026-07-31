@@ -125,6 +125,9 @@ pub(crate) async fn handle_realtime_press(
     }
     while session_open {
         match session.recv().await {
+            // Partials are only a live preview. A late cumulative partial during
+            // finalization would be inserted and immediately removed by cleanup.
+            Some(event) if !process_during_finalization(&event) => {}
             Some(event) => {
                 process_realtime_event(event, state, &mut live_text, &mut failed, &mut tail_safe)
                     .await
@@ -133,6 +136,10 @@ pub(crate) async fn handle_realtime_press(
         }
     }
     finish_realtime_result(config, state, audio_data, live_text, failed, tail_safe).await;
+}
+
+fn process_during_finalization(event: &realtime::RealtimeEvent) -> bool {
+    !matches!(event, realtime::RealtimeEvent::PartialTranscript(_))
 }
 
 async fn wait_for_release(max_dur: Duration, hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>) {
@@ -371,5 +378,18 @@ mod tests {
             realtime_next_step(false, true, true, false),
             RealtimeNextStep::Done
         );
+    }
+
+    #[test]
+    fn finalization_ignores_only_provisional_partials() {
+        assert!(!process_during_finalization(
+            &realtime::RealtimeEvent::PartialTranscript("late preview".into())
+        ));
+        assert!(process_during_finalization(
+            &realtime::RealtimeEvent::CommittedTranscript("final output".into())
+        ));
+        assert!(process_during_finalization(
+            &realtime::RealtimeEvent::Error(realtime::RealtimeError::TaskFailed)
+        ));
     }
 }
