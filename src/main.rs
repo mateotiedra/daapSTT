@@ -1,6 +1,7 @@
 //! Voice Input Daemon — global push-to-talk dictation via ElevenLabs Scribe v2.
 
 mod audio;
+mod clipboard;
 mod config;
 mod deliver;
 mod hotkey;
@@ -9,6 +10,7 @@ mod live_text;
 mod media;
 mod mode;
 mod notify;
+mod placeholder;
 mod realtime;
 mod realtime_mode;
 mod transcribe;
@@ -226,6 +228,7 @@ async fn handle_batch_press(
         ),
     }
 
+    let clipboard = clipboard::capture().await;
     info!("recording stopped — transcribing...");
     let audio_data = match recording_handle.stop().await {
         Ok(audio) => audio,
@@ -237,13 +240,14 @@ async fn handle_batch_press(
             return;
         }
     };
-    transcribe_batch(config, state, audio_data).await;
+    transcribe_batch(config, state, audio_data, &clipboard).await;
 }
 
 pub(crate) async fn transcribe_batch(
     config: &config::Config,
     state: &mut RecordingState,
     audio_data: audio::AudioRecording,
+    clipboard: &str,
 ) {
     if audio_data.data.len() < 800 {
         info!(
@@ -274,7 +278,8 @@ pub(crate) async fn transcribe_batch(
             media::resume(&state.media_state).await;
         }
         Ok(text) => {
-            info!("transcription: {text}");
+            let text = placeholder::replace_banana(&text, clipboard);
+            info!("transcription completed");
             state.cleanup_marker().await;
             let _ = deliver::type_text(&text).await;
             media::resume(&state.media_state).await;

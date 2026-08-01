@@ -16,7 +16,7 @@ Alt+Space held ──► § marker appears ──► you speak ──► release
 
 - **Linux** with Wayland (tested on Hyprland)
 - **PipeWire** for audio capture
-- **wtype**, **pw-record**, **notify-send**, and **keyd** installed
+- **wtype**, **pw-record**, **notify-send**, **keyd**, and **wl-clipboard** (`wl-paste`) installed
 - **keyd** enabled and configured in its existing `/etc/keyd/default.conf` (see Quick Start)
 - **input** group membership for `/dev/input/event*` access
 - An [ElevenLabs API key](https://elevenlabs.io/app/settings/api-keys)
@@ -63,6 +63,8 @@ journalctl --user -u voice-daemon -f
 | Quick tap (< 0.05s) | `§` removed, no action |
 
 Batch transcription is the default. In both Batch and Realtime modes, the user hotkey remains **hold Alt+Space and release it to stop**. `F24` is only keyd's internal normalized signal; it is not a second user-facing hotkey.
+
+Speaking standalone `banana` (case-insensitive) substitutes the text clipboard snapshot captured when recording stops. All occurrences are replaced, including punctuation-adjacent ones but not those inside longer words. This works in Batch and Realtime modes; an empty or unavailable text clipboard removes the placeholder. Clipboard content stays local and may include multiple lines.
 
 Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds:
 
