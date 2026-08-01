@@ -19,7 +19,13 @@ pub(crate) fn clean(text: &str) -> String {
 
         let trailing_periods = text.bytes().rev().take_while(|&byte| byte == b'.').count();
         if trailing_periods >= 3 {
-            text = &text[..text.len() - trailing_periods];
+            text = text[..text.len() - trailing_periods].trim_end();
+            continue;
+        }
+
+        let without_trailing_hyphens = text.trim_end_matches('-').trim_end();
+        if without_trailing_hyphens.len() != text.len() {
+            text = without_trailing_hyphens;
             continue;
         }
 
@@ -53,6 +59,13 @@ mod tests {
         assert_eq!(clean("unfinished......"), "unfinished");
         assert_eq!(clean("unfinished……"), "unfinished");
         assert_eq!(clean("unfinished...…"), "unfinished");
+    }
+
+    #[test]
+    fn removes_terminal_hyphens_and_their_preceding_space() {
+        assert_eq!(clean("unfinished -"), "unfinished");
+        assert_eq!(clean("unfinished---"), "unfinished");
+        assert_eq!(clean("-"), "");
     }
 
     #[test]
