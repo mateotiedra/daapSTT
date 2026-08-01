@@ -1,8 +1,8 @@
 //! Hotkey detection via evdev.
 //!
-//! Monitors all keyboard devices in `/dev/input/event*` for F24 press
-//! and release events. Sends events through a tokio channel to the
-//! orchestrator.
+//! Monitors all F24-capable devices in `/dev/input/event*`. The keyd virtual
+//! keyboard's LeftAlt transitions are also used to determine when it is safe
+//! to inject text after an F24 release.
 //!
 //! # Architecture
 //!
@@ -11,8 +11,8 @@
 //! - Each keyboard device gets a `spawn_blocking` thread that reads
 //!   events via evdev's blocking API.
 //! - Raw key events are sent through an mpsc channel to a state machine.
-//! - The state machine emits `HotkeyEvent::Press` and `HotkeyEvent::Release`
-//!   for F24 down and up, respectively.
+//! - The state machine emits `Press` for F24 down, `ReleaseStarted` for F24
+//!   up, and `ReleaseCompleted` once any restored keyd Alt has cleared.
 
 use anyhow::Result;
 use evdev::{Device, InputEventKind, Key};
@@ -26,27 +26,51 @@ use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-/// A hotkey event: either a press (start recording) or release (stop recording).
+/// Semantic hotkey events. `ReleaseStarted` stops recording immediately;
+/// `ReleaseCompleted` means keyd is no longer holding a restored LeftAlt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
     Press,
-    Release,
+    ReleaseStarted,
+    ReleaseCompleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RawEvent {
     F24Down,
     F24Up,
+    KeydLeftAltDown,
+    KeydLeftAltUp,
 }
 
 const COOLDOWN_DURATION: Duration = Duration::from_millis(200);
+/// keyd emits a restored Alt synchronously with F24-up, if it restores one.
+const ALT_RESTORE_SETTLE_DURATION: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy)]
+enum ReleasePhase {
+    Idle,
+    Settling { deadline: Instant },
+    WaitingForAltUp,
+}
 
 /// State for the modifier-free F24 hotkey.
-#[derive(Default)]
 struct HotkeyState {
     f24_pressed: bool,
     recording: bool,
     cooldown_until: Option<Instant>,
+    release_phase: ReleasePhase,
+}
+
+impl Default for HotkeyState {
+    fn default() -> Self {
+        Self {
+            f24_pressed: false,
+            recording: false,
+            cooldown_until: None,
+            release_phase: ReleasePhase::Idle,
+        }
+    }
 }
 
 impl HotkeyState {
@@ -58,7 +82,6 @@ impl HotkeyState {
                     return None;
                 }
                 self.f24_pressed = true;
-
                 if self.recording || self.cooldown_until.is_some_and(|until| now < until) {
                     None
                 } else {
@@ -72,22 +95,58 @@ impl HotkeyState {
                     return None;
                 }
                 self.f24_pressed = false;
-
                 if self.recording {
                     self.recording = false;
                     self.cooldown_until = Some(now + COOLDOWN_DURATION);
-                    Some(HotkeyEvent::Release)
+                    self.release_phase = ReleasePhase::Settling {
+                        deadline: now + ALT_RESTORE_SETTLE_DURATION,
+                    };
+                    Some(HotkeyEvent::ReleaseStarted)
+                } else {
+                    None
+                }
+            }
+            RawEvent::KeydLeftAltDown => {
+                if matches!(self.release_phase, ReleasePhase::Settling { .. }) {
+                    self.release_phase = ReleasePhase::WaitingForAltUp;
+                }
+                None
+            }
+            RawEvent::KeydLeftAltUp => {
+                if matches!(self.release_phase, ReleasePhase::WaitingForAltUp) {
+                    self.release_phase = ReleasePhase::Idle;
+                    Some(HotkeyEvent::ReleaseCompleted)
                 } else {
                     None
                 }
             }
         }
     }
+
+    fn settle_deadline(&self) -> Option<Instant> {
+        match self.release_phase {
+            ReleasePhase::Settling { deadline } => Some(deadline),
+            ReleasePhase::Idle | ReleasePhase::WaitingForAltUp => None,
+        }
+    }
+
+    /// Completes a release only when no restored Alt arrived during settling.
+    fn settle(&mut self, now: Instant) -> Option<HotkeyEvent> {
+        let ReleasePhase::Settling { deadline } = self.release_phase else {
+            return None;
+        };
+        if now < deadline {
+            return None;
+        }
+        self.release_phase = ReleasePhase::Idle;
+        Some(HotkeyEvent::ReleaseCompleted)
+    }
 }
 
 /// Start monitoring keyboard devices for F24 events.
 ///
-/// Sends `HotkeyEvent::Press` on F24 down and `HotkeyEvent::Release` on F24 up.
+/// Sends `Press` on F24 down, `ReleaseStarted` on F24 up, then
+/// `ReleaseCompleted` once a possible keyd-restored Alt has cleared.
 ///
 /// The `shutdown` Notify is triggered by the caller to signal graceful
 /// shutdown — the state machine and manager use it to exit cleanly.
@@ -126,9 +185,10 @@ pub async fn run(tx: mpsc::Sender<HotkeyEvent>, shutdown: Arc<Notify>) -> Result
                 let raw_tx = raw_tx.clone();
                 let path = device_info.path.clone();
                 let path_for_closure = path.clone();
+                let is_keyd_virtual_keyboard = device_info.is_keyd_virtual_keyboard;
 
                 let handle = tokio::task::spawn_blocking(move || {
-                    read_keyboard_events(&path_for_closure, raw_tx);
+                    read_keyboard_events(&path_for_closure, is_keyd_virtual_keyboard, raw_tx);
                 });
                 active_readers.insert(path, handle);
             }
@@ -172,21 +232,40 @@ pub async fn run(tx: mpsc::Sender<HotkeyEvent>, shutdown: Arc<Notify>) -> Result
         let mut state = HotkeyState::default();
 
         loop {
-            let event = tokio::select! {
-                event = raw_rx.recv() => event,
-                _ = state_shutdown.notified() => {
-                    info!("state machine received shutdown signal");
-                    break;
+            let hotkey_event = if let Some(deadline) = state.settle_deadline() {
+                tokio::select! {
+                    biased;
+                    event = raw_rx.recv() => match event {
+                        Some(event) => state.process(event, Instant::now()),
+                        None => {
+                            info!("raw event channel closed");
+                            break;
+                        }
+                    },
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        state.settle(Instant::now())
+                    }
+                    _ = state_shutdown.notified() => {
+                        info!("state machine received shutdown signal");
+                        break;
+                    }
                 }
+            } else {
+                let event = tokio::select! {
+                    event = raw_rx.recv() => event,
+                    _ = state_shutdown.notified() => {
+                        info!("state machine received shutdown signal");
+                        break;
+                    }
+                };
+                let Some(event) = event else {
+                    info!("raw event channel closed");
+                    break;
+                };
+                state.process(event, Instant::now())
             };
 
-            let Some(event) = event else {
-                // raw_rx channel closed — device threads exited
-                info!("raw event channel closed");
-                break;
-            };
-
-            if let Some(hotkey_event) = state.process(event, Instant::now()) {
+            if let Some(hotkey_event) = hotkey_event {
                 if tx.send(hotkey_event).await.is_err() {
                     break;
                 }
@@ -211,6 +290,8 @@ pub async fn run(tx: mpsc::Sender<HotkeyEvent>, shutdown: Arc<Notify>) -> Result
 #[derive(Debug, Clone)]
 struct KeyboardInfo {
     path: PathBuf,
+    // Only this authoritative keyd output device may affect Alt safety.
+    is_keyd_virtual_keyboard: bool,
 }
 
 /// Find all keyboard devices in /dev/input/.
@@ -223,7 +304,18 @@ fn find_keyboards() -> Result<Vec<KeyboardInfo>> {
         // Check if this device supports keyboard keys
         if let Some(keys) = device.supported_keys() {
             if keys.contains(Key::KEY_F24) {
-                keyboards.push(KeyboardInfo { path });
+                let input_id = device.input_id();
+                let is_keyd_virtual_keyboard = device.name() == Some("keyd virtual keyboard");
+                debug!(
+                    "found F24 device {path:?}: name={:?}, vendor={:04x}, product={:04x}",
+                    device.name(),
+                    input_id.vendor(),
+                    input_id.product(),
+                );
+                keyboards.push(KeyboardInfo {
+                    path,
+                    is_keyd_virtual_keyboard,
+                });
             }
         }
     }
@@ -231,20 +323,27 @@ fn find_keyboards() -> Result<Vec<KeyboardInfo>> {
     Ok(keyboards)
 }
 
-/// Converts the relevant non-repeat evdev key transitions to raw events.
-fn raw_event(key: Key, value: i32) -> Option<RawEvent> {
-    match (key, value) {
-        (Key::KEY_F24, 1) => Some(RawEvent::F24Down),
-        (Key::KEY_F24, 0) => Some(RawEvent::F24Up),
+/// Converts non-repeat F24 transitions from all readers and LeftAlt transitions
+/// only from the authoritative keyd virtual keyboard.
+fn raw_event(key: Key, value: i32, is_keyd_virtual_keyboard: bool) -> Option<RawEvent> {
+    match (key, value, is_keyd_virtual_keyboard) {
+        (Key::KEY_F24, 1, _) => Some(RawEvent::F24Down),
+        (Key::KEY_F24, 0, _) => Some(RawEvent::F24Up),
+        (Key::KEY_LEFTALT, 1, true) => Some(RawEvent::KeydLeftAltDown),
+        (Key::KEY_LEFTALT, 0, true) => Some(RawEvent::KeydLeftAltUp),
         _ => None,
     }
 }
 
 /// Read keyboard events from a single device in a blocking loop.
 ///
-/// Runs in `spawn_blocking`. Sends `RawEvent` messages for relevant
-/// F24 presses/releases.
-fn read_keyboard_events(path: &std::path::Path, tx: mpsc::Sender<RawEvent>) {
+/// Runs in `spawn_blocking`. Sends F24 events and, for keyd's authoritative
+/// virtual keyboard only, LeftAlt transitions.
+fn read_keyboard_events(
+    path: &std::path::Path,
+    is_keyd_virtual_keyboard: bool,
+    tx: mpsc::Sender<RawEvent>,
+) {
     // Try to open the device — if it fails, just return
     let mut device = loop {
         match Device::open(path) {
@@ -287,7 +386,7 @@ fn read_keyboard_events(path: &std::path::Path, tx: mpsc::Sender<RawEvent>) {
                         continue;
                     };
 
-                    let send = raw_event(key, ev.value());
+                    let send = raw_event(key, ev.value(), is_keyd_virtual_keyboard);
 
                     if let Some(raw_event) = send {
                         if tx.blocking_send(raw_event).is_err() {
@@ -315,97 +414,4 @@ fn read_keyboard_events(path: &std::path::Path, tx: mpsc::Sender<RawEvent>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn time() -> Instant {
-        Instant::now()
-    }
-
-    #[test]
-    fn normal_hold_and_release() {
-        let now = time();
-        let mut state = HotkeyState::default();
-
-        assert_eq!(
-            state.process(RawEvent::F24Down, now),
-            Some(HotkeyEvent::Press)
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Up, now),
-            Some(HotkeyEvent::Release)
-        );
-    }
-
-    #[test]
-    fn repeats_and_duplicate_transitions_are_ignored() {
-        let now = time();
-        let mut state = HotkeyState::default();
-
-        assert_eq!(raw_event(Key::KEY_F24, 2), None);
-        assert_eq!(
-            state.process(RawEvent::F24Down, now),
-            Some(HotkeyEvent::Press)
-        );
-        assert_eq!(state.process(RawEvent::F24Down, now), None);
-        assert_eq!(
-            state.process(RawEvent::F24Up, now),
-            Some(HotkeyEvent::Release)
-        );
-        assert_eq!(state.process(RawEvent::F24Up, now), None);
-    }
-
-    #[test]
-    fn cooldown_suppresses_mirrored_sequence_then_retriggers() {
-        let now = time();
-        let mut state = HotkeyState::default();
-
-        assert_eq!(
-            state.process(RawEvent::F24Down, now),
-            Some(HotkeyEvent::Press)
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Up, now),
-            Some(HotkeyEvent::Release)
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Down, now + Duration::from_millis(100)),
-            None
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Up, now + Duration::from_millis(101)),
-            None
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Down, now + COOLDOWN_DURATION),
-            Some(HotkeyEvent::Press)
-        );
-    }
-
-    #[test]
-    fn release_recovers_after_suppressed_press() {
-        let now = time();
-        let mut state = HotkeyState::default();
-
-        assert_eq!(
-            state.process(RawEvent::F24Down, now),
-            Some(HotkeyEvent::Press)
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Up, now),
-            Some(HotkeyEvent::Release)
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Down, now + Duration::from_millis(1)),
-            None
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Up, now + Duration::from_millis(2)),
-            None
-        );
-        assert_eq!(
-            state.process(RawEvent::F24Down, now + COOLDOWN_DURATION),
-            Some(HotkeyEvent::Press)
-        );
-    }
-}
+mod tests;

@@ -122,7 +122,7 @@ Set these variables in `~/.config/voice-daemon/env`:
 ```
 physical Alt+Space ──► keyd (`[alt] space = f24`) ──► evdev F24 ──► hotkey.rs
                                                                   │
-                                                        (Press/Release via channel)
+                                                  (Press/two-stage release channel)
                                                                   │
                                                           main.rs (orchestrator)
                                      │
@@ -136,12 +136,12 @@ physical Alt+Space ──► keyd (`[alt] space = f24`) ──► evdev F24 ─�
                                notify.rs
 ```
 
-keyd consumes the physical Alt modifier while it emits the internal `F24` event. This keeps Alt from being visible to the active application while `wtype` inserts live text, preventing Alt-modified text input. The daemon listens for `F24`; users continue to use only Alt+Space.
+keyd temporarily removes Alt while it emits the internal `F24` event. If Space is released before physical Alt, keyd restores Alt after `F24`-up; the daemon therefore stops recording immediately at `F24`-up but defers final text reconciliation and cleanup until the restored Alt is released. If Alt is released first, finalization proceeds after a short event-settle interval. Users continue to use only Alt+Space.
 
 ## Troubleshooting
 
 - **Alt+Space does not start recording:** Confirm keyd is running with `systemctl status keyd`, then verify the existing `/etc/keyd/default.conf` contains the `[alt]` section and `space = f24` mapping shown above. Restart keyd after changes.
-- **Live text is affected by Alt shortcuts:** Ensure the mapping is in `/etc/keyd/default.conf`, not a separate wildcard configuration. keyd must normalize Alt+Space to its internal `F24` signal so the physical Alt modifier is not passed through while `wtype` types.
+- **Live text is affected by Alt shortcuts:** Ensure the mapping is in `/etc/keyd/default.conf`, not a separate wildcard configuration. The daemon observes both `F24` and Alt transitions from keyd's virtual keyboard so it can defer release-time `wtype` edits until Alt is safe.
 
 ## Development
 

@@ -26,6 +26,7 @@ pub struct LiveTextTransition {
 pub struct LiveText {
     committed_any: bool,
     committed_text: String,
+    latest_committed_segment: String,
     tail: String,
 }
 
@@ -55,6 +56,15 @@ impl LiveText {
     /// Once text was committed, a non-empty subsequent segment gets one leading
     /// space. An empty partial always removes the tail without adding a space.
     pub fn partial(&self, partial: &str) -> LiveTextTransition {
+        // Some providers deliver a delayed partial for the segment that was
+        // just finalized. It must not replace a newer mutable tail.
+        if !self.latest_committed_segment.is_empty() && partial == self.latest_committed_segment {
+            return LiveTextTransition {
+                next: self.clone(),
+                edit: LiveTextEdit::default(),
+            };
+        }
+
         self.replace_tail(segment_text(self.committed_any, partial))
     }
 
@@ -73,6 +83,7 @@ impl LiveText {
             next: Self {
                 committed_any: true,
                 committed_text: format!("{}{target}", self.committed_text),
+                latest_committed_segment: finalized.to_owned(),
                 tail: String::new(),
             },
             edit,
@@ -90,6 +101,7 @@ impl LiveText {
             next: Self {
                 committed_any: self.committed_any,
                 committed_text: self.committed_text.clone(),
+                latest_committed_segment: self.latest_committed_segment.clone(),
                 tail: target,
             },
             edit,
@@ -256,5 +268,42 @@ mod tests {
         );
         assert!(transition.next.committed_any());
         assert_eq!(transition.next.tail(), "");
+    }
+
+    #[test]
+    fn stale_partial_after_commit_is_a_noop() {
+        let state = LiveText::new().commit("segment").next;
+        let transition = state.partial("segment");
+
+        assert_eq!(transition.edit, LiveTextEdit::default());
+        assert_eq!(transition.next, state);
+    }
+
+    #[test]
+    fn stale_partial_preserves_a_newer_tail() {
+        let state = LiveText::new()
+            .commit("committed")
+            .next
+            .partial("newer")
+            .next;
+        let transition = state.partial("committed");
+
+        assert_eq!(transition.edit, LiveTextEdit::default());
+        assert_eq!(transition.next.tail(), " newer");
+    }
+
+    #[test]
+    fn repeated_finalized_segment_is_still_committed() {
+        let state = LiveText::new().commit("segment").next;
+        let transition = state.commit("segment");
+
+        assert_eq!(
+            transition.edit,
+            LiveTextEdit {
+                backspaces: 0,
+                insert: " segment".into()
+            }
+        );
+        assert_eq!(transition.next.committed_text(), "segment segment");
     }
 }

@@ -71,8 +71,12 @@ pub(crate) async fn handle_realtime_press(
         },
         Err(e) => {
             warn!("failed to load realtime keyterms: {e}");
-            wait_for_release(max_dur, hotkey_rx).await;
-            finish_realtime_without_session(config, state, recording_handle).await;
+            if wait_for_release(max_dur, hotkey_rx).await {
+                finish_realtime_without_session(config, state, recording_handle).await;
+            } else {
+                let _ = recording_handle.stop().await;
+                state.resume_media().await;
+            }
             return;
         }
     };
@@ -80,8 +84,12 @@ pub(crate) async fn handle_realtime_press(
         Ok(session) => session,
         Err(e) => {
             warn!("failed to start realtime session: {e}");
-            wait_for_release(max_dur, hotkey_rx).await;
-            finish_realtime_without_session(config, state, recording_handle).await;
+            if wait_for_release(max_dur, hotkey_rx).await {
+                finish_realtime_without_session(config, state, recording_handle).await;
+            } else {
+                let _ = recording_handle.stop().await;
+                state.resume_media().await;
+            }
             return;
         }
     };
@@ -90,24 +98,48 @@ pub(crate) async fn handle_realtime_press(
     let mut failed = None;
     let mut tail_safe = true;
     let mut session_open = true;
+    let mut release_started = false;
+    let mut keyboard_safe = true;
     let timer = tokio::time::sleep(max_dur);
     tokio::pin!(timer);
     loop {
         tokio::select! {
+            biased;
+            hotkey = hotkey_rx.recv() => match hotkey {
+                Some(hotkey::HotkeyEvent::ReleaseStarted) => {
+                    release_started = true;
+                    break;
+                }
+                Some(hotkey::HotkeyEvent::ReleaseCompleted) => {
+                    warn!("ignoring stray hotkey release completion while recording")
+                }
+                Some(hotkey::HotkeyEvent::Press) => warn!("ignoring repeated hotkey press while recording"),
+                None => {
+                    warn!("hotkey channel closed; modifier state is unknown");
+                    keyboard_safe = false;
+                    break;
+                }
+            },
             event = session.recv(), if session_open => match event {
                 Some(event) => process_realtime_event(event, state, &mut live_text, &mut failed, &mut tail_safe).await,
                 None => { session_open = false; if failed.is_none() { failed = Some(realtime::RealtimeError::TaskFailed); } }
-            },
-            hotkey = hotkey_rx.recv() => match hotkey {
-                Some(hotkey::HotkeyEvent::Release) => break,
-                Some(hotkey::HotkeyEvent::Press) => warn!("ignoring repeated hotkey press while recording"),
-                None => { info!("hotkey channel closed, stopping"); break; }
             },
             _ = &mut timer => { info!("max recording duration ({}s) reached — auto-stopping", config.max_recording_secs); break; }
         }
     }
 
-    let audio_data = match recording_handle.stop().await {
+    let audio_result = recording_handle.stop().await;
+    if !keyboard_safe {
+        state.resume_media().await;
+        return;
+    }
+    if release_started && !crate::wait_for_release_completion(hotkey_rx).await {
+        // The hotkey's modifier state is unknown, so never touch live text or
+        // the marker through wtype.
+        state.resume_media().await;
+        return;
+    }
+    let audio_data = match audio_result {
         Ok(audio) => audio,
         Err(e) => {
             warn!("audio capture error: {e}");
@@ -144,11 +176,19 @@ fn process_during_finalization(event: &realtime::RealtimeEvent) -> bool {
     !matches!(event, realtime::RealtimeEvent::PartialTranscript(_))
 }
 
-async fn wait_for_release(max_dur: Duration, hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>) {
-    match tokio::time::timeout(max_dur, hotkey_rx.recv()).await {
-        Ok(Some(hotkey::HotkeyEvent::Release)) | Ok(None) => {}
-        Ok(Some(_)) => warn!("unexpected hotkey event while recording"),
-        Err(_) => info!("max recording duration reached — auto-stopping"),
+/// Returns false only when a release began but its completion cannot be
+/// observed. In that case callers must avoid every keyboard operation.
+async fn wait_for_release(
+    max_dur: Duration,
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
+) -> bool {
+    match tokio::time::timeout(max_dur, crate::wait_for_release_started(hotkey_rx)).await {
+        Ok(crate::ReleaseStart::Started) => crate::wait_for_release_completion(hotkey_rx).await,
+        Ok(crate::ReleaseStart::ChannelClosed) => false,
+        Err(_) => {
+            info!("max recording duration reached — auto-stopping");
+            true
+        }
     }
 }
 
@@ -379,71 +419,4 @@ fn realtime_error_notification(error: &realtime::RealtimeError) -> &'static str 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fallback_happens_after_a_provider_failure_before_any_commit() {
-        assert_eq!(
-            realtime_next_step(false, true, true, true),
-            RealtimeNextStep::FallbackBatch
-        );
-    }
-
-    #[test]
-    fn unsafe_delivery_failure_notifies_without_batch_fallback() {
-        assert_eq!(
-            realtime_next_step(false, true, false, true),
-            RealtimeNextStep::NotifyFailure
-        );
-    }
-
-    #[test]
-    fn failure_after_a_commit_notifies_without_batch_fallback() {
-        assert_eq!(
-            realtime_next_step(true, true, true, true),
-            RealtimeNextStep::NotifyFailure
-        );
-    }
-
-    #[test]
-    fn success_or_unusable_audio_needs_no_fallback() {
-        assert_eq!(
-            realtime_next_step(false, false, true, true),
-            RealtimeNextStep::Done
-        );
-        assert_eq!(
-            realtime_next_step(false, true, true, false),
-            RealtimeNextStep::Done
-        );
-    }
-
-    #[test]
-    fn placeholder_commit_backspaces_the_full_raw_segment() {
-        assert_eq!(
-            raw_committed_segment(false, "banana")
-                .graphemes(true)
-                .count(),
-            6
-        );
-        assert_eq!(
-            raw_committed_segment(true, "a\u{301} banana")
-                .graphemes(true)
-                .count(),
-            9
-        );
-    }
-
-    #[test]
-    fn finalization_ignores_only_provisional_partials() {
-        assert!(!process_during_finalization(
-            &realtime::RealtimeEvent::PartialTranscript("late preview".into())
-        ));
-        assert!(process_during_finalization(
-            &realtime::RealtimeEvent::CommittedTranscript("final output".into())
-        ));
-        assert!(process_during_finalization(
-            &realtime::RealtimeEvent::Error(realtime::RealtimeError::TaskFailed)
-        ));
-    }
-}
+mod tests;

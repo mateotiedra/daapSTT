@@ -137,6 +137,13 @@ fn load_env_file(path: &Path) {
     }
 }
 
+fn keyterms_path_from(value: Option<&str>) -> PathBuf {
+    value
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_keyterms_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,11 +161,4 @@ mod tests {
         assert_eq!(keyterms_path_from(None), default_keyterms_path());
         assert_eq!(keyterms_path_from(Some("  \t")), default_keyterms_path());
     }
-}
-
-fn keyterms_path_from(value: Option<&str>) -> PathBuf {
-    value
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_keyterms_path)
 }

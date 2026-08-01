@@ -121,7 +121,12 @@ async fn main() -> Result<()> {
                     mode::Mode::Batch => handle_batch_press(&config, &mut state, &mut hotkey_rx).await,
                     mode::Mode::Realtime => realtime_mode::handle_realtime_press(&config, &mut state, &mut hotkey_rx).await,
                 },
-                Some(hotkey::HotkeyEvent::Release) => info!("ignoring hotkey release without press"),
+                Some(hotkey::HotkeyEvent::ReleaseStarted) => {
+                    info!("ignoring hotkey release start without press")
+                }
+                Some(hotkey::HotkeyEvent::ReleaseCompleted) => {
+                    info!("ignoring hotkey release completion without press")
+                }
                 None => { info!("hotkey channel closed"); break; }
             },
             _ = shutdown_notify.notified() => {
@@ -213,23 +218,32 @@ async fn handle_batch_press(
             }
         };
 
-    match tokio::time::timeout(max_dur, hotkey_rx.recv()).await {
-        Ok(Some(hotkey::HotkeyEvent::Release)) => {}
-        Ok(Some(_)) => warn!("unexpected hotkey event while recording"),
-        Ok(None) => {
-            info!("hotkey channel closed, stopping");
-            state.cleanup_marker().await;
+    let release_started = match tokio::time::timeout(max_dur, wait_for_release_started(hotkey_rx))
+        .await
+    {
+        Ok(ReleaseStart::Started) => true,
+        Ok(ReleaseStart::ChannelClosed) => {
+            warn!("hotkey channel closed; skipping keyboard cleanup because modifier state is unknown");
             media::resume(&state.media_state).await;
             return;
         }
-        Err(_) => info!(
-            "max recording duration ({}s) reached — auto-stopping",
-            config.max_recording_secs
-        ),
-    }
+        Err(_) => {
+            info!(
+                "max recording duration ({}s) reached — auto-stopping",
+                config.max_recording_secs
+            );
+            false
+        }
+    };
 
     info!("recording stopped — transcribing...");
-    let audio_data = match recording_handle.stop().await {
+    let audio_result = recording_handle.stop().await;
+    if release_started && !wait_for_release_completion(hotkey_rx).await {
+        // A restored Alt may still be held. Do not send any wtype-backed cleanup.
+        state.resume_media().await;
+        return;
+    }
+    let audio_data = match audio_result {
         Ok(audio) => audio,
         Err(e) => {
             warn!("audio capture error: {e}");
@@ -240,6 +254,53 @@ async fn handle_batch_press(
         }
     };
     transcribe_batch(config, state, audio_data).await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseStart {
+    Started,
+    ChannelClosed,
+}
+
+/// Waits for the first phase of a physical release, ignoring events that do
+/// not belong to the active recording.
+pub(crate) async fn wait_for_release_started(
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
+) -> ReleaseStart {
+    loop {
+        match hotkey_rx.recv().await {
+            Some(hotkey::HotkeyEvent::ReleaseStarted) => return ReleaseStart::Started,
+            Some(hotkey::HotkeyEvent::Press) => {
+                warn!("ignoring repeated hotkey press while recording")
+            }
+            Some(hotkey::HotkeyEvent::ReleaseCompleted) => {
+                warn!("ignoring stray hotkey release completion while recording")
+            }
+            None => return ReleaseStart::ChannelClosed,
+        }
+    }
+}
+
+/// Waits until keyd's possible restored Alt has been released. A closed
+/// channel is unsafe: callers must not perform keyboard cleanup or delivery.
+pub(crate) async fn wait_for_release_completion(
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
+) -> bool {
+    loop {
+        match hotkey_rx.recv().await {
+            Some(hotkey::HotkeyEvent::ReleaseCompleted) => return true,
+            Some(hotkey::HotkeyEvent::Press) => {
+                warn!("ignoring repeated hotkey press while waiting for release completion")
+            }
+            Some(hotkey::HotkeyEvent::ReleaseStarted) => {
+                warn!("ignoring repeated hotkey release start while waiting for completion")
+            }
+            None => {
+                warn!("hotkey channel closed before release completion; keyboard state is unsafe");
+                return false;
+            }
+        }
+    }
 }
 
 pub(crate) async fn transcribe_batch(
@@ -334,5 +395,51 @@ mod tests {
         );
         assert!(parse_realtime_command(&[]).is_err());
         assert!(parse_realtime_command(&["on".into(), "now".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn release_start_wait_routes_stray_events_before_start() {
+        let (tx, mut rx) = mpsc::channel(3);
+        tx.send(hotkey::HotkeyEvent::Press).await.unwrap();
+        tx.send(hotkey::HotkeyEvent::ReleaseCompleted)
+            .await
+            .unwrap();
+        tx.send(hotkey::HotkeyEvent::ReleaseStarted).await.unwrap();
+
+        assert_eq!(
+            wait_for_release_started(&mut rx).await,
+            ReleaseStart::Started
+        );
+    }
+
+    #[tokio::test]
+    async fn release_start_wait_reports_channel_close() {
+        let (tx, mut rx) = mpsc::channel(1);
+        drop(tx);
+
+        assert_eq!(
+            wait_for_release_started(&mut rx).await,
+            ReleaseStart::ChannelClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn release_completion_wait_ignores_repeated_events() {
+        let (tx, mut rx) = mpsc::channel(3);
+        tx.send(hotkey::HotkeyEvent::Press).await.unwrap();
+        tx.send(hotkey::HotkeyEvent::ReleaseStarted).await.unwrap();
+        tx.send(hotkey::HotkeyEvent::ReleaseCompleted)
+            .await
+            .unwrap();
+
+        assert!(wait_for_release_completion(&mut rx).await);
+    }
+
+    #[tokio::test]
+    async fn release_completion_wait_fails_closed_on_channel_close() {
+        let (tx, mut rx) = mpsc::channel(1);
+        drop(tx);
+
+        assert!(!wait_for_release_completion(&mut rx).await);
     }
 }

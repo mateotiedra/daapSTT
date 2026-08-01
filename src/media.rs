@@ -146,8 +146,8 @@ pub async fn resume(state: &MediaState) {
 /// Format is tab-separated: `playerName\tstatus`, one per line.
 /// Example:
 /// ```text
-/// firefox	Paused
-/// spotify	Playing
+/// firefox    Paused
+/// spotify    Playing
 /// ```
 fn parse_playing_names(stdout: &str) -> Vec<String> {
     let mut playing = Vec::new();
