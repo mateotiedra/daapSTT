@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use log::{debug, warn};
 use tokio::process::Command;
 
-use crate::clipboard::{self, PasteShortcut};
+use crate::clipboard::{self, PastePlan, PasteShortcut};
 use crate::placeholder::TranscriptChunk;
 
 /// Type the marker character into the active window.
@@ -64,10 +64,19 @@ pub async fn deliver_chunks(chunks: &[TranscriptChunk<'_>]) -> Result<()> {
 }
 
 async fn paste_clipboard() -> Result<()> {
-    type_text("\"").await?;
-    let shortcut = clipboard::paste_shortcut().await;
-    run_wtype(paste_args(shortcut), "native paste").await?;
-    type_text("\"").await
+    let plan = clipboard::paste_plan().await;
+    let delimiter = paste_delimiter(plan);
+    type_text(delimiter).await?;
+    run_wtype(paste_args(plan.shortcut), "native paste").await?;
+    type_text(delimiter).await
+}
+
+fn paste_delimiter(plan: PastePlan) -> &'static str {
+    if plan.is_image {
+        " "
+    } else {
+        "\""
+    }
 }
 
 fn backspace_args(backspaces: usize) -> Vec<&'static str> {
@@ -147,6 +156,24 @@ mod tests {
         assert_eq!(
             paste_args(PasteShortcut::CtrlShiftV),
             ["-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"]
+        );
+    }
+
+    #[test]
+    fn images_use_spaces_and_text_uses_quotes() {
+        assert_eq!(
+            paste_delimiter(PastePlan {
+                shortcut: PasteShortcut::CtrlV,
+                is_image: true,
+            }),
+            " "
+        );
+        assert_eq!(
+            paste_delimiter(PastePlan {
+                shortcut: PasteShortcut::CtrlShiftV,
+                is_image: false,
+            }),
+            "\""
         );
     }
 
