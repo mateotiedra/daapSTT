@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use log::{info, warn};
 use tokio::sync::mpsc;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::live_text::LiveText;
 use crate::{
-    audio, clipboard, config, deliver, hotkey, keyterms, notify, placeholder, realtime,
-    transcribe_batch, RecordingState,
+    audio, config, deliver, hotkey, keyterms, notify, placeholder, realtime, transcribe_batch,
+    RecordingState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +72,7 @@ pub(crate) async fn handle_realtime_press(
         Err(e) => {
             warn!("failed to load realtime keyterms: {e}");
             wait_for_release(max_dur, hotkey_rx).await;
-            let clipboard = clipboard::capture().await;
-            finish_realtime_without_session(config, state, recording_handle, &clipboard).await;
+            finish_realtime_without_session(config, state, recording_handle).await;
             return;
         }
     };
@@ -81,8 +81,7 @@ pub(crate) async fn handle_realtime_press(
         Err(e) => {
             warn!("failed to start realtime session: {e}");
             wait_for_release(max_dur, hotkey_rx).await;
-            let clipboard = clipboard::capture().await;
-            finish_realtime_without_session(config, state, recording_handle, &clipboard).await;
+            finish_realtime_without_session(config, state, recording_handle).await;
             return;
         }
     };
@@ -108,7 +107,6 @@ pub(crate) async fn handle_realtime_press(
         }
     }
 
-    let clipboard = clipboard::capture().await;
     let audio_data = match recording_handle.stop().await {
         Ok(audio) => audio,
         Err(e) => {
@@ -139,10 +137,7 @@ pub(crate) async fn handle_realtime_press(
             None => session_open = false,
         }
     }
-    finish_realtime_result(
-        config, state, audio_data, live_text, failed, tail_safe, &clipboard,
-    )
-    .await;
+    finish_realtime_result(config, state, audio_data, live_text, failed, tail_safe).await;
 }
 
 fn process_during_finalization(event: &realtime::RealtimeEvent) -> bool {
@@ -161,7 +156,6 @@ async fn finish_realtime_without_session(
     config: &config::Config,
     state: &mut RecordingState,
     recording_handle: audio::RecordingHandle,
-    clipboard: &str,
 ) {
     match recording_handle.stop().await {
         Ok(audio_data) => {
@@ -172,7 +166,6 @@ async fn finish_realtime_without_session(
                 LiveText::new(),
                 Some(realtime::RealtimeError::TaskFailed),
                 true,
-                clipboard,
             )
             .await
         }
@@ -224,6 +217,8 @@ async fn apply_live_text(
     if !text.is_empty() && !live_text.committed_any() && live_text.tail().is_empty() {
         state.cleanup_marker().await;
     }
+    let committed_segment =
+        committed.then(|| raw_committed_segment(live_text.committed_any(), text));
     let transition = if committed {
         live_text.commit(text)
     } else {
@@ -238,6 +233,40 @@ async fn apply_live_text(
         return;
     }
     *live_text = transition.next;
+
+    let Some(segment) = committed_segment else {
+        return;
+    };
+    let chunks = placeholder::parse_banana_chunks(&segment);
+    if !chunks
+        .iter()
+        .any(|chunk| matches!(chunk, placeholder::TranscriptChunk::ClipboardPlaceholder))
+    {
+        return;
+    }
+
+    // The raw committed segment is still at the cursor. Remove only that
+    // segment, then redeliver its literals and native clipboard pastes. The
+    // LiveText state remains raw so pasted content is never revisited later.
+    if let Err(e) = deliver::apply_realtime_edit(segment.graphemes(true).count(), "").await {
+        warn!("failed to prepare realtime clipboard paste: {e}");
+        *failed = Some(realtime::RealtimeError::TaskFailed);
+        *tail_safe = false;
+        return;
+    }
+    if let Err(e) = deliver::deliver_chunks(&chunks).await {
+        warn!("failed to deliver realtime clipboard paste: {e}");
+        *failed = Some(realtime::RealtimeError::TaskFailed);
+        *tail_safe = false;
+    }
+}
+
+fn raw_committed_segment(already_committed: bool, text: &str) -> String {
+    if already_committed {
+        format!(" {text}")
+    } else {
+        text.to_owned()
+    }
 }
 
 async fn cleanup_live_tail(live_text: &mut LiveText, tail_safe: bool) -> bool {
@@ -258,31 +287,6 @@ async fn cleanup_live_tail(live_text: &mut LiveText, tail_safe: bool) -> bool {
     true
 }
 
-/// Clears the provisional tail, then rewrites the retained committed text.
-/// Both edits are attempted only while it is safe to modify what was typed.
-async fn rewrite_live_committed(
-    live_text: &mut LiveText,
-    tail_safe: bool,
-    clipboard: &str,
-) -> bool {
-    if !cleanup_live_tail(live_text, tail_safe).await {
-        return false;
-    }
-    let text = placeholder::replace_banana(live_text.committed_text(), clipboard);
-    let transition = live_text.rewrite_committed(&text);
-    if transition.edit.backspaces == 0 && transition.edit.insert.is_empty() {
-        return true;
-    }
-    if let Err(e) =
-        deliver::apply_realtime_edit(transition.edit.backspaces, &transition.edit.insert).await
-    {
-        warn!("failed to deliver final realtime transcript: {e}");
-        return false;
-    }
-    *live_text = transition.next;
-    true
-}
-
 async fn finish_realtime_result(
     config: &config::Config,
     state: &mut RecordingState,
@@ -290,12 +294,11 @@ async fn finish_realtime_result(
     mut live_text: LiveText,
     failed: Option<realtime::RealtimeError>,
     tail_safe: bool,
-    clipboard: &str,
 ) {
     let usable_audio =
         audio_data.data.len() >= 800 && !audio::is_silence(audio_data.peak_amplitude);
     if !usable_audio {
-        rewrite_live_committed(&mut live_text, tail_safe, clipboard).await;
+        cleanup_live_tail(&mut live_text, tail_safe).await;
         state.cleanup_marker().await;
         if audio::is_silence(audio_data.peak_amplitude) && audio_data.data.len() >= 800 {
             let _ = notify::error(
@@ -315,7 +318,7 @@ async fn finish_realtime_result(
     ) {
         RealtimeNextStep::FallbackBatch => {
             if cleanup_live_tail(&mut live_text, tail_safe).await {
-                transcribe_batch(config, state, audio_data, clipboard).await;
+                transcribe_batch(config, state, audio_data).await;
             } else {
                 state.cleanup_marker().await;
                 let _ = notify::error(
@@ -327,7 +330,7 @@ async fn finish_realtime_result(
             }
         }
         RealtimeNextStep::NotifyFailure => {
-            rewrite_live_committed(&mut live_text, tail_safe, clipboard).await;
+            cleanup_live_tail(&mut live_text, tail_safe).await;
             state.cleanup_marker().await;
             let _ = notify::error(
                 "Voice daemon",
@@ -337,7 +340,7 @@ async fn finish_realtime_result(
             state.resume_media().await;
         }
         RealtimeNextStep::Done => {
-            rewrite_live_committed(&mut live_text, tail_safe, clipboard).await;
+            cleanup_live_tail(&mut live_text, tail_safe).await;
             state.cleanup_marker().await;
             state.resume_media().await;
         }
@@ -412,6 +415,22 @@ mod tests {
         assert_eq!(
             realtime_next_step(false, true, true, false),
             RealtimeNextStep::Done
+        );
+    }
+
+    #[test]
+    fn placeholder_commit_backspaces_the_full_raw_segment() {
+        assert_eq!(
+            raw_committed_segment(false, "banana")
+                .graphemes(true)
+                .count(),
+            6
+        );
+        assert_eq!(
+            raw_committed_segment(true, "a\u{301} banana")
+                .graphemes(true)
+                .count(),
+            9
         );
     }
 

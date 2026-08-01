@@ -228,7 +228,6 @@ async fn handle_batch_press(
         ),
     }
 
-    let clipboard = clipboard::capture().await;
     info!("recording stopped — transcribing...");
     let audio_data = match recording_handle.stop().await {
         Ok(audio) => audio,
@@ -240,14 +239,13 @@ async fn handle_batch_press(
             return;
         }
     };
-    transcribe_batch(config, state, audio_data, &clipboard).await;
+    transcribe_batch(config, state, audio_data).await;
 }
 
 pub(crate) async fn transcribe_batch(
     config: &config::Config,
     state: &mut RecordingState,
     audio_data: audio::AudioRecording,
-    clipboard: &str,
 ) {
     if audio_data.data.len() < 800 {
         info!(
@@ -278,10 +276,20 @@ pub(crate) async fn transcribe_batch(
             media::resume(&state.media_state).await;
         }
         Ok(text) => {
-            let text = placeholder::replace_banana(&text, clipboard);
+            let chunks = placeholder::parse_banana_chunks(&text);
             info!("transcription completed");
             state.cleanup_marker().await;
-            let _ = deliver::type_text(&text).await;
+            let result = if chunks
+                .iter()
+                .any(|chunk| matches!(chunk, placeholder::TranscriptChunk::ClipboardPlaceholder))
+            {
+                deliver::deliver_chunks(&chunks).await
+            } else {
+                deliver::type_text(&text).await
+            };
+            if let Err(e) = result {
+                warn!("failed to deliver transcription: {e}");
+            }
             media::resume(&state.media_state).await;
         }
         Err(e) => {

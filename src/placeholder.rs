@@ -1,22 +1,34 @@
-//! Expansion of the `banana` dictation placeholder.
+//! Parsing of the `banana` dictation placeholder.
 
-/// Replaces standalone ASCII `banana` tokens, case-insensitively.
+/// An ordered portion of a transcript to deliver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TranscriptChunk<'a> {
+    Literal(&'a str),
+    ClipboardPlaceholder,
+}
+
+/// Splits standalone ASCII `banana` tokens into literal and clipboard chunks.
 ///
-/// Unicode alphanumeric characters and underscores are considered word
-/// characters, so a placeholder embedded in an identifier is left unchanged.
-pub fn replace_banana(text: &str, replacement: &str) -> String {
-    let mut result = String::with_capacity(text.len());
+/// Matching is case-insensitive. Unicode alphanumeric characters and
+/// underscores are word characters, so a token embedded in an identifier is
+/// left literal.
+pub fn parse_banana_chunks(text: &str) -> Vec<TranscriptChunk<'_>> {
+    let mut chunks = Vec::new();
     let mut cursor = 0;
 
     while let Some(found) = find_banana(&text[cursor..]) {
         let start = cursor + found;
         let end = start + "banana".len();
-        result.push_str(&text[cursor..start]);
-        result.push_str(replacement);
+        if start > cursor {
+            chunks.push(TranscriptChunk::Literal(&text[cursor..start]));
+        }
+        chunks.push(TranscriptChunk::ClipboardPlaceholder);
         cursor = end;
     }
-    result.push_str(&text[cursor..]);
-    result
+    if cursor < text.len() {
+        chunks.push(TranscriptChunk::Literal(&text[cursor..]));
+    }
+    chunks
 }
 
 fn find_banana(text: &str) -> Option<usize> {
@@ -55,27 +67,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replaces_case_insensitive_punctuation_and_multiple_tokens() {
+    fn parses_case_insensitive_tokens_in_order() {
         assert_eq!(
-            replace_banana("BANANA, banana! (BaNaNa)", "clip"),
-            "clip, clip! (clip)"
+            parse_banana_chunks("BANANA, banana! (BaNaNa)"),
+            vec![
+                TranscriptChunk::ClipboardPlaceholder,
+                TranscriptChunk::Literal(", "),
+                TranscriptChunk::ClipboardPlaceholder,
+                TranscriptChunk::Literal("! ("),
+                TranscriptChunk::ClipboardPlaceholder,
+                TranscriptChunk::Literal(")"),
+            ]
         );
     }
 
     #[test]
-    fn does_not_replace_embedded_or_unicode_word_tokens() {
+    fn preserves_multiple_literals_and_multiline_order() {
         assert_eq!(
-            replace_banana("bananas banana_split ébanana bananaé", "clip"),
-            "bananas banana_split ébanana bananaé"
+            parse_banana_chunks("before banana\nafter banana end"),
+            vec![
+                TranscriptChunk::Literal("before "),
+                TranscriptChunk::ClipboardPlaceholder,
+                TranscriptChunk::Literal("\nafter "),
+                TranscriptChunk::ClipboardPlaceholder,
+                TranscriptChunk::Literal(" end"),
+            ]
         );
     }
 
     #[test]
-    fn supports_empty_and_multiline_replacements() {
-        assert_eq!(replace_banana("banana banana", ""), " ");
+    fn leaves_nonmatching_identifiers_literal() {
         assert_eq!(
-            replace_banana("a banana\nb", "one\ntwo\n"),
-            "a one\ntwo\n\nb"
+            parse_banana_chunks("bananas banana_split ébanana bananaé"),
+            vec![TranscriptChunk::Literal(
+                "bananas banana_split ébanana bananaé"
+            )]
         );
+    }
+
+    #[test]
+    fn empty_input_has_no_chunks() {
+        assert!(parse_banana_chunks("").is_empty());
     }
 }

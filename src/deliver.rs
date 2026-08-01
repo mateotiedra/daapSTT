@@ -1,182 +1,155 @@
-//! Text delivery via wtype keystroke simulation.
-//!
-//! Types the § marker character on recording start, backspaces it on stop,
-//! and types the transcribed text into the active Wayland window.
-//!
-//! # Known Limitations
-//!
-//! - If the cursor moves between typing the marker and the transcript
-//!   (e.g., user clicks elsewhere), the backspace will delete the wrong
-//!   character. This is a v1 limitation — a future version could track
-//!   the window under the cursor at press time.
-//! - Text is typed at full speed with no inter-character delay. Some
-//!   applications may drop keystrokes if they arrive too fast; this can
-//!   be mitigated with the `-d` delay flag if needed.
+//! Text and native clipboard delivery via wtype.
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
 use tokio::process::Command;
 
+use crate::clipboard::{self, PasteShortcut};
+use crate::placeholder::TranscriptChunk;
+
 /// Type the marker character into the active window.
-///
-/// Uses `wtype` text mode — types the raw string without key simulation,
-/// which means any UTF-8 character works regardless of keyboard layout.
 pub async fn type_marker(marker: &str) -> Result<()> {
-    debug!("typing marker: {marker}");
-
-    let mut output = Command::new("wtype")
-        .arg("-") // read text from stdin to avoid shell escaping issues
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn wtype for marker")?;
-
-    // Write the marker text to wtype's stdin
-    use tokio::io::AsyncWriteExt;
-    if let Some(mut stdin) = output.stdin.take() {
-        stdin
-            .write_all(marker.as_bytes())
-            .await
-            .context("failed to write marker to wtype stdin")?;
-        // stdin is dropped here, which closes the pipe
-    }
-
-    let status = output
-        .wait_with_output()
-        .await
-        .context("failed to wait for wtype marker")?;
-
-    if !status.status.success() {
-        let stderr = String::from_utf8_lossy(&status.stderr);
-        warn!("wtype marker failed: {stderr}");
-        return Err(anyhow::anyhow!("wtype marker failed: {stderr}"));
-    }
-
-    Ok(())
+    debug!("typing marker");
+    type_with_wtype(marker, "marker").await
 }
 
 /// Backspace to remove the marker character.
-///
-/// Simulates a single Backspace key press via `wtype -k backspace`.
-/// Uses named key resolution from libxkbcommon, which is
-/// layout-independent.
 pub async fn backspace_marker() -> Result<()> {
     debug!("backspacing marker");
-
-    let output = Command::new("wtype")
-        .arg("-k")
-        .arg("backspace")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn wtype for backspace")?;
-
-    let status = output
-        .wait_with_output()
-        .await
-        .context("failed to wait for wtype backspace")?;
-
-    if !status.status.success() {
-        let stderr = String::from_utf8_lossy(&status.stderr);
-        warn!("wtype backspace failed: {stderr}");
-        return Err(anyhow::anyhow!("wtype backspace failed: {stderr}"));
-    }
-
-    Ok(())
+    run_wtype(&backspace_args(1), "marker backspace").await
 }
 
 /// Apply one realtime-tail replacement edit.
 ///
 /// Backspaces and replacement text are sent through one `wtype` invocation so
-/// their order is preserved. `backspaces` must count user-visible graphemes,
-/// not bytes or Unicode scalar values.
+/// their order is preserved. `backspaces` must count visible graphemes.
 pub async fn apply_realtime_edit(backspaces: usize, text: &str) -> Result<()> {
     if backspaces == 0 && text.is_empty() {
         return Ok(());
     }
 
-    debug!(
-        "applying realtime edit: {backspaces} backspaces, {} bytes inserted",
-        text.len()
-    );
-
+    debug!("applying realtime edit: {backspaces} backspaces");
     let mut command = Command::new("wtype");
-    for _ in 0..backspaces {
-        command.arg("-k").arg("backspace");
+    for arg in backspace_args(backspaces) {
+        command.arg(arg);
     }
     if text.is_empty() {
         command.stdin(std::process::Stdio::null());
+        run_command(command, "realtime edit").await
     } else {
         command.arg("-").stdin(std::process::Stdio::piped());
+        run_command_with_text(command, text, "realtime edit").await
     }
+}
 
-    let mut output = command
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn wtype for realtime edit")?;
+/// Type plain transcript text into the active window.
+pub async fn type_text(text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    debug!("typing transcript");
+    type_with_wtype(text, "text").await
+}
 
-    if !text.is_empty() {
-        use tokio::io::AsyncWriteExt;
-        if let Some(mut stdin) = output.stdin.take() {
-            stdin
-                .write_all(text.as_bytes())
-                .await
-                .context("failed to write realtime edit text to wtype stdin")?;
+/// Delivers transcript chunks in order, pasting the native clipboard at each
+/// placeholder without reading or logging its payload.
+pub async fn deliver_chunks(chunks: &[TranscriptChunk<'_>]) -> Result<()> {
+    for chunk in chunks {
+        match chunk {
+            TranscriptChunk::Literal(text) => type_text(text).await?,
+            TranscriptChunk::ClipboardPlaceholder => paste_clipboard().await?,
         }
     }
-
-    let status = output
-        .wait_with_output()
-        .await
-        .context("failed to wait for wtype realtime edit")?;
-
-    if !status.status.success() {
-        let stderr = String::from_utf8_lossy(&status.stderr);
-        warn!("wtype realtime edit failed: {stderr}");
-        return Err(anyhow::anyhow!("wtype realtime edit failed: {stderr}"));
-    }
-
     Ok(())
 }
 
-/// Type the transcribed text into the active window.
-///
-/// Pipes the text through wtype's stdin to avoid shell escaping issues
-/// with special characters. Text is typed as-is — no transformation
-/// is applied.
-pub async fn type_text(text: &str) -> Result<()> {
-    debug!("typing transcript: {text}");
+async fn paste_clipboard() -> Result<()> {
+    let shortcut = clipboard::paste_shortcut().await;
+    run_wtype(paste_args(shortcut), "native paste").await
+}
 
-    let mut output = Command::new("wtype")
-        .arg("-") // read text from stdin
-        .stdin(std::process::Stdio::piped())
+fn backspace_args(backspaces: usize) -> Vec<&'static str> {
+    std::iter::repeat_n(["-k", "backspace"], backspaces)
+        .flatten()
+        .collect()
+}
+
+fn paste_args(shortcut: PasteShortcut) -> &'static [&'static str] {
+    match shortcut {
+        PasteShortcut::CtrlV => &["-M", "ctrl", "-k", "v", "-m", "ctrl"],
+        PasteShortcut::CtrlShiftV => &[
+            "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
+        ],
+    }
+}
+
+async fn type_with_wtype(text: &str, operation: &str) -> Result<()> {
+    let mut command = Command::new("wtype");
+    command.arg("-").stdin(std::process::Stdio::piped());
+    run_command_with_text(command, text, operation).await
+}
+
+async fn run_wtype(args: &[&str], operation: &str) -> Result<()> {
+    let mut command = Command::new("wtype");
+    command.args(args).stdin(std::process::Stdio::null());
+    run_command(command, operation).await
+}
+
+async fn run_command_with_text(mut command: Command, text: &str, operation: &str) -> Result<()> {
+    let mut child = command
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
-        .context("failed to spawn wtype for text")?;
-
-    // Write the text to wtype's stdin
+        .with_context(|| format!("failed to start wtype for {operation}"))?;
     use tokio::io::AsyncWriteExt;
-    if let Some(mut stdin) = output.stdin.take() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(text.as_bytes())
             .await
-            .context("failed to write text to wtype stdin")?;
-        // stdin is dropped here, which closes the pipe
+            .with_context(|| format!("failed to write wtype {operation}"))?;
     }
+    wait_for_wtype(child, operation).await
+}
 
-    let status = output
-        .wait_with_output()
+async fn run_command(mut command: Command, operation: &str) -> Result<()> {
+    let child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start wtype for {operation}"))?;
+    wait_for_wtype(child, operation).await
+}
+
+async fn wait_for_wtype(mut child: tokio::process::Child, operation: &str) -> Result<()> {
+    let status = child
+        .wait()
         .await
-        .context("failed to wait for wtype text")?;
+        .with_context(|| format!("failed waiting for wtype {operation}"))?;
+    if !status.success() {
+        warn!("wtype {operation} failed");
+        anyhow::bail!("wtype {operation} failed");
+    }
+    Ok(())
+}
 
-    if !status.status.success() {
-        let stderr = String::from_utf8_lossy(&status.stderr);
-        warn!("wtype text failed: {stderr}");
-        return Err(anyhow::anyhow!("wtype text failed: {stderr}"));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_paste_command_sequences_are_exact() {
+        assert_eq!(
+            paste_args(PasteShortcut::CtrlV),
+            ["-M", "ctrl", "-k", "v", "-m", "ctrl"]
+        );
+        assert_eq!(
+            paste_args(PasteShortcut::CtrlShiftV),
+            ["-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"]
+        );
     }
 
-    Ok(())
+    #[test]
+    fn backspace_planner_repeats_one_key_per_grapheme() {
+        assert_eq!(backspace_args(2), ["-k", "backspace", "-k", "backspace"]);
+    }
 }

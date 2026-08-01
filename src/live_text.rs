@@ -40,8 +40,8 @@ impl LiveText {
         self.committed_any
     }
 
-    /// The full immutable text already delivered to the user.
-    pub fn committed_text(&self) -> &str {
+    #[cfg(test)]
+    fn committed_text(&self) -> &str {
         &self.committed_text
     }
 
@@ -76,22 +76,6 @@ impl LiveText {
                 tail: String::new(),
             },
             edit,
-        }
-    }
-
-    /// Rewrites committed text using a grapheme-safe common-prefix edit.
-    ///
-    /// Callers must first remove the mutable tail, then apply this edit only if
-    /// the visible text is known to be safe to modify.
-    pub fn rewrite_committed(&self, text: &str) -> LiveTextTransition {
-        debug_assert!(self.tail.is_empty());
-        LiveTextTransition {
-            next: Self {
-                committed_any: self.committed_any,
-                committed_text: text.to_owned(),
-                tail: String::new(),
-            },
-            edit: tail_edit(&self.committed_text, text),
         }
     }
 
@@ -250,12 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn committed_rewrite_replaces_only_changed_grapheme_suffix() {
-        let state = LiveText::new().commit("hello 👨‍👩‍👧‍👦 banana").next;
-        let transition = state.rewrite_committed("hello 👨‍👩‍👧‍👦 clipboard");
-        assert_eq!(transition.edit.backspaces, 6);
-        assert_eq!(transition.edit.insert, "clipboard");
-        assert_eq!(transition.next.committed_text(), "hello 👨‍👩‍👧‍👦 clipboard");
+    fn committed_transcript_retains_raw_placeholder_for_future_segments() {
+        let state = LiveText::new().commit("hello banana").next;
+        assert_eq!(state.committed_text(), "hello banana");
+        assert_eq!(
+            state.commit("again").next.committed_text(),
+            "hello banana again"
+        );
     }
 
     #[test]

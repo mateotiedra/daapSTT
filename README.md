@@ -64,7 +64,7 @@ journalctl --user -u voice-daemon -f
 
 Batch transcription is the default. In both Batch and Realtime modes, the user hotkey remains **hold Alt+Space and release it to stop**. `F24` is only keyd's internal normalized signal; it is not a second user-facing hotkey.
 
-Speaking standalone `banana` (case-insensitive) substitutes the text clipboard snapshot captured when recording stops. All occurrences are replaced, including punctuation-adjacent ones but not those inside longer words. This works in Batch and Realtime modes; an empty or unavailable text clipboard removes the placeholder. Clipboard content stays local and may include multiple lines.
+Speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. In Realtime mode, paste happens when recognition becomes a stable committed segment, before the hotkey is released. Batch mode necessarily waits for the provider transcription result, but pastes immediately once `banana` is recognized.
 
 Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds:
 
