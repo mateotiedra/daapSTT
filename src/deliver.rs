@@ -64,8 +64,10 @@ pub async fn deliver_chunks(chunks: &[TranscriptChunk<'_>]) -> Result<()> {
 }
 
 async fn paste_clipboard() -> Result<()> {
+    type_text("\"").await?;
     let shortcut = clipboard::paste_shortcut().await;
-    run_wtype(paste_args(shortcut), "native paste").await
+    run_wtype(paste_args(shortcut), "native paste").await?;
+    type_text("\"").await
 }
 
 fn backspace_args(backspaces: usize) -> Vec<&'static str> {
