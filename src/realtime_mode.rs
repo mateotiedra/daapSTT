@@ -75,6 +75,7 @@ pub(crate) async fn handle_realtime_press(
                 finish_realtime_without_session(config, state, recording_handle).await;
             } else {
                 let _ = recording_handle.stop().await;
+                state.restore_other_mic_apps().await;
                 state.resume_media().await;
             }
             return;
@@ -88,6 +89,7 @@ pub(crate) async fn handle_realtime_press(
                 finish_realtime_without_session(config, state, recording_handle).await;
             } else {
                 let _ = recording_handle.stop().await;
+                state.restore_other_mic_apps().await;
                 state.resume_media().await;
             }
             return;
@@ -129,6 +131,7 @@ pub(crate) async fn handle_realtime_press(
     }
 
     let audio_result = recording_handle.stop().await;
+    state.restore_other_mic_apps().await;
     if !keyboard_safe {
         state.resume_media().await;
         return;
@@ -197,7 +200,9 @@ async fn finish_realtime_without_session(
     state: &mut RecordingState,
     recording_handle: audio::RecordingHandle,
 ) {
-    match recording_handle.stop().await {
+    let audio_result = recording_handle.stop().await;
+    state.restore_other_mic_apps().await;
+    match audio_result {
         Ok(audio_data) => {
             finish_realtime_result(
                 config,

@@ -8,6 +8,7 @@ mod hotkey;
 mod keyterms;
 mod live_text;
 mod media;
+mod mic;
 mod mode;
 mod notify;
 mod placeholder;
@@ -26,6 +27,7 @@ pub(crate) struct RecordingState {
     marker_active: bool,
     marker_char: String,
     media_state: media::MediaState,
+    mic_mute_state: mic::MicMuteState,
 }
 
 impl RecordingState {
@@ -34,6 +36,7 @@ impl RecordingState {
             marker_active: false,
             marker_char,
             media_state: media::MediaState::new(),
+            mic_mute_state: mic::MicMuteState::new(),
         }
     }
 
@@ -44,7 +47,18 @@ impl RecordingState {
         }
     }
 
-    pub(crate) async fn resume_media(&self) {
+    pub(crate) async fn mute_other_mic_apps(&mut self) {
+        self.mic_mute_state.mute_other_apps().await;
+    }
+
+    pub(crate) async fn restore_other_mic_apps(&mut self) {
+        self.mic_mute_state.restore().await;
+    }
+
+    pub(crate) async fn resume_media(&mut self) {
+        // Defensive fallback for every recording exit. Normal capture paths
+        // restore mic users earlier, immediately after `pw-record` stops.
+        self.restore_other_mic_apps().await;
         media::resume(&self.media_state).await;
     }
 }
@@ -132,6 +146,7 @@ async fn main() -> Result<()> {
             _ = shutdown_notify.notified() => {
                 info!("shutting down gracefully...");
                 state.cleanup_marker().await;
+                state.resume_media().await;
                 break;
             }
         }
@@ -184,10 +199,15 @@ pub(crate) async fn begin_recording(config: &config::Config, state: &mut Recordi
     }
     if let Err(e) = deliver::type_marker(&state.marker_char).await {
         warn!("failed to type marker: {e}");
-        media::resume(&state.media_state).await;
+        state.resume_media().await;
         return false;
     }
     state.marker_active = true;
+    if config.mute_other_mic_apps {
+        // Snapshot before spawning our own pw-record stream so only other apps
+        // are muted and the physical microphone remains available to daapSTT.
+        state.mute_other_mic_apps().await;
+    }
     true
 }
 
@@ -208,7 +228,7 @@ async fn handle_batch_press(
             Err(e) => {
                 warn!("failed to start recording: {e}");
                 state.cleanup_marker().await;
-                media::resume(&state.media_state).await;
+                state.resume_media().await;
                 let _ = notify::error(
                     "Voice daemon",
                     "Failed to start recording — microphone not available?",
@@ -224,7 +244,9 @@ async fn handle_batch_press(
         Ok(ReleaseStart::Started) => true,
         Ok(ReleaseStart::ChannelClosed) => {
             warn!("hotkey channel closed; skipping keyboard cleanup because modifier state is unknown");
-            media::resume(&state.media_state).await;
+            let _ = recording_handle.stop().await;
+            state.restore_other_mic_apps().await;
+            state.resume_media().await;
             return;
         }
         Err(_) => {
@@ -238,6 +260,7 @@ async fn handle_batch_press(
 
     info!("recording stopped — transcribing...");
     let audio_result = recording_handle.stop().await;
+    state.restore_other_mic_apps().await;
     if release_started && !wait_for_release_completion(hotkey_rx).await {
         // A restored Alt may still be held. Do not send any wtype-backed cleanup.
         state.resume_media().await;
@@ -248,7 +271,7 @@ async fn handle_batch_press(
         Err(e) => {
             warn!("audio capture error: {e}");
             state.cleanup_marker().await;
-            media::resume(&state.media_state).await;
+            state.resume_media().await;
             let _ = notify::error("Voice daemon", "Audio capture failed").await;
             return;
         }
@@ -314,7 +337,7 @@ pub(crate) async fn transcribe_batch(
             audio_data.duration_secs
         );
         state.cleanup_marker().await;
-        media::resume(&state.media_state).await;
+        state.resume_media().await;
         return;
     }
     if audio::is_silence(audio_data.peak_amplitude) {
@@ -323,7 +346,7 @@ pub(crate) async fn transcribe_batch(
             audio_data.peak_amplitude
         );
         state.cleanup_marker().await;
-        media::resume(&state.media_state).await;
+        state.resume_media().await;
         let _ = notify::error(
             "Voice daemon",
             "Microphone appears silent — check your input volume/source in PipeWire",
@@ -334,7 +357,7 @@ pub(crate) async fn transcribe_batch(
     match transcribe::transcribe(config, &audio_data.data).await {
         Ok(text) if text.trim().is_empty() => {
             state.cleanup_marker().await;
-            media::resume(&state.media_state).await;
+            state.resume_media().await;
         }
         Ok(text) => {
             let chunks = placeholder::parse_banana_chunks(&text);
@@ -351,14 +374,14 @@ pub(crate) async fn transcribe_batch(
             if let Err(e) = result {
                 warn!("failed to deliver transcription: {e}");
             }
-            media::resume(&state.media_state).await;
+            state.resume_media().await;
         }
         Err(e) => {
             let err_msg = e.to_string();
             warn!("transcription failed: {err_msg}");
             state.cleanup_marker().await;
             let _ = notify::error("Voice daemon", batch_error_notification(&err_msg)).await;
-            media::resume(&state.media_state).await;
+            state.resume_media().await;
         }
     }
 }

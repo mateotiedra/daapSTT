@@ -26,6 +26,8 @@ pub struct Config {
     /// Whether to pause media players (via playerctl) when recording starts.
     /// When enabled, media is paused on hotkey press and resumed on release.
     pub pause_media: bool,
+    /// Whether to mute other apps' active microphone capture streams while recording.
+    pub mute_other_mic_apps: bool,
     /// File containing one keyterm per line.
     pub keyterms_path: PathBuf,
 }
@@ -67,10 +69,8 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
             record_target: env::var("VOICE_RECORD_TARGET").ok(),
-            pause_media: env::var("VOICE_PAUSE_MEDIA")
-                .ok()
-                .map(|v| v.to_lowercase() != "false" && v != "0")
-                .unwrap_or(true),
+            pause_media: env_flag("VOICE_PAUSE_MEDIA", true),
+            mute_other_mic_apps: env_flag("VOICE_MUTE_OTHER_MIC_APPS", true),
             keyterms_path: keyterms_path_from_env(),
         })
     }
@@ -87,6 +87,18 @@ pub fn keyterms_path() -> PathBuf {
 fn keyterms_path_from_env() -> PathBuf {
     let value = env::var("VOICE_KEYTERMS_FILE").ok();
     keyterms_path_from(value.as_deref())
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
+        .unwrap_or(default)
 }
 
 fn default_keyterms_path() -> PathBuf {
