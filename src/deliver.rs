@@ -54,28 +54,43 @@ pub async fn type_text(text: &str) -> Result<()> {
 /// Delivers transcript chunks in order, pasting the native clipboard at each
 /// placeholder without reading or logging its payload.
 pub async fn deliver_chunks(chunks: &[TranscriptChunk<'_>]) -> Result<()> {
-    for chunk in chunks {
+    for (index, chunk) in chunks.iter().enumerate() {
         match chunk {
             TranscriptChunk::Literal(text) => type_text(text).await?,
-            TranscriptChunk::ClipboardPlaceholder => paste_clipboard().await?,
+            TranscriptChunk::ClipboardPlaceholder => {
+                let has_space_before = chunks[..index].last().is_some_and(|chunk| {
+                    matches!(chunk, TranscriptChunk::Literal(text) if text.ends_with(char::is_whitespace))
+                });
+                let has_space_after = chunks[index + 1..].first().is_some_and(|chunk| {
+                    matches!(chunk, TranscriptChunk::Literal(text) if text.starts_with(char::is_whitespace))
+                });
+                paste_clipboard(has_space_before, has_space_after).await?;
+            }
         }
     }
     Ok(())
 }
 
-async fn paste_clipboard() -> Result<()> {
+async fn paste_clipboard(has_space_before: bool, has_space_after: bool) -> Result<()> {
     let plan = clipboard::paste_plan().await;
-    let delimiter = paste_delimiter(plan);
-    type_text(delimiter).await?;
+    let (before, after) = paste_delimiters(plan, has_space_before, has_space_after);
+    type_text(before).await?;
     run_wtype(paste_args(plan.shortcut), "native paste").await?;
-    type_text(delimiter).await
+    type_text(after).await
 }
 
-fn paste_delimiter(plan: PastePlan) -> &'static str {
+fn paste_delimiters(
+    plan: PastePlan,
+    has_space_before: bool,
+    has_space_after: bool,
+) -> (&'static str, &'static str) {
     if plan.is_image {
-        " "
+        (
+            if has_space_before { "" } else { " " },
+            if has_space_after { "" } else { " " },
+        )
     } else {
-        "\""
+        ("\"", "\"")
     }
 }
 
@@ -170,20 +185,29 @@ mod tests {
     }
 
     #[test]
-    fn images_use_spaces_and_text_uses_quotes() {
+    fn image_spaces_are_added_only_when_missing() {
+        let image_plan = PastePlan {
+            shortcut: PasteShortcut::CtrlV,
+            is_image: true,
+        };
+        assert_eq!(paste_delimiters(image_plan, false, false), (" ", " "));
+        assert_eq!(paste_delimiters(image_plan, true, true), ("", ""));
+        assert_eq!(paste_delimiters(image_plan, true, false), ("", " "));
+        assert_eq!(paste_delimiters(image_plan, false, true), (" ", ""));
+    }
+
+    #[test]
+    fn text_paste_always_uses_quotes() {
         assert_eq!(
-            paste_delimiter(PastePlan {
-                shortcut: PasteShortcut::CtrlV,
-                is_image: true,
-            }),
-            " "
-        );
-        assert_eq!(
-            paste_delimiter(PastePlan {
-                shortcut: PasteShortcut::CtrlShiftV,
-                is_image: false,
-            }),
-            "\""
+            paste_delimiters(
+                PastePlan {
+                    shortcut: PasteShortcut::CtrlShiftV,
+                    is_image: false,
+                },
+                true,
+                true,
+            ),
+            ("\"", "\"")
         );
     }
 
