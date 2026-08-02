@@ -1,184 +1,164 @@
-//! Media player control via playerctl.
+//! Output-sink muting via `pactl`.
 //!
-//! Pauses all MPRIS-compatible media players (Spotify, browsers, VLC, etc.)
-//! when recording starts, and resumes only the players that were actually
-//! playing at the time of the pause.
-//!
-//! Uses `playerctl` under the hood — the standard MPRIS controller for Linux.
-//! If playerctl is not installed, all operations are silent no-ops.
+//! A recording snapshots the output sinks that were unmuted, mutes only those
+//! sinks, and restores precisely that snapshot afterwards. Sinks that were
+//! already muted are deliberately left untouched.
 
 use log::{debug, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use serde::Deserialize;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 
-/// Tracks media state at pause time.
-/// - `was_playing`: whether any player was playing (controls whether we pause)
-/// - `playing_players`: names of specific players that were playing (controls resume)
-pub struct MediaState {
-    was_playing: Arc<AtomicBool>,
-    playing_players: Arc<Mutex<Vec<String>>>,
+/// Output sinks muted for the active recording and awaiting restoration.
+pub struct OutputMuteState {
+    muted_sinks: Vec<MutedSink>,
 }
 
-impl MediaState {
+struct MutedSink {
+    index: u32,
+    label: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct Sink {
+    index: u32,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    mute: bool,
+}
+
+impl Sink {
+    fn label(&self) -> String {
+        self.description
+            .as_deref()
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or(&self.name)
+            .to_owned()
+    }
+}
+
+impl OutputMuteState {
     pub fn new() -> Self {
         Self {
-            was_playing: Arc::new(AtomicBool::new(false)),
-            playing_players: Arc::new(Mutex::new(Vec::new())),
+            muted_sinks: Vec::new(),
         }
     }
 }
 
-/// Check which MPRIS players are playing, pause them all,
-/// and record both the playing status and specific player names.
-pub async fn pause_all(state: &MediaState) {
-    // Each recording gets a fresh snapshot. Otherwise a prior recording's
-    // players could be resumed after a later recording that found none playing.
-    state.was_playing.store(false, Ordering::Relaxed);
-    state.playing_players.lock().await.clear();
+/// Mute every output sink that is currently unmuted.
+///
+/// Any stale recording snapshot is restored before a new one is taken. Missing
+/// or failing `pactl`, and malformed sink JSON, degrade safely to a no-op.
+pub async fn mute_unmuted_outputs(state: &mut OutputMuteState) {
+    restore_muted_outputs(state).await;
 
-    // 1. Get the full status output from all players.
-    //    We use an explicit format string to get both player name and status,
-    //    since the default output only includes statuses without names.
-    let output = match Command::new("playerctl")
-        .args([
-            "--all-players",
-            "status",
-            "--format",
-            "{{playerName}}\t{{status}}\n",
-        ])
+    let output = match Command::new("pactl")
+        .args(["--format=json", "list", "sinks"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
         .await
     {
-        Ok(out) => out,
-        Err(e) => {
-            debug!("playerctl not found or failed: {e}");
+        Ok(output) => output,
+        Err(error) => {
+            debug!("pactl is unavailable while listing output sinks: {error}");
             return;
         }
     };
 
     if !output.status.success() {
-        debug!(
-            "playerctl status exited with {} — treating as not playing",
-            output.status
-        );
+        debug!("pactl list sinks exited with {}", output.status);
         return;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sinks = match unmuted_sinks(&output.stdout) {
+        Ok(sinks) => sinks,
+        Err(error) => {
+            warn!("could not parse pactl output-sink JSON: {error}");
+            return;
+        }
+    };
 
-    // 2. Extract the names of players that are currently playing.
-    let playing_names = parse_playing_names(&stdout);
-    if playing_names.is_empty() {
-        debug!("no media players are playing — nothing to pause");
-        return;
+    for sink in sinks {
+        let label = sink.label();
+        if set_sink_mute(sink.index, true).await {
+            debug!("muted output sink {} ({label})", sink.index);
+            state.muted_sinks.push(MutedSink {
+                index: sink.index,
+                label,
+            });
+        }
     }
+}
 
-    // 3. Record this recording's players before pausing them.
-    debug!("pausing: {:?}", playing_names);
+/// Restore only output sinks that this recording successfully muted.
+///
+/// The snapshot is consumed before issuing commands, making repeated cleanup
+/// idempotent even if a restore command itself fails.
+pub async fn restore_muted_outputs(state: &mut OutputMuteState) {
+    let muted_sinks = std::mem::take(&mut state.muted_sinks);
+    for sink in muted_sinks {
+        if set_sink_mute(sink.index, false).await {
+            debug!("restored output sink {} ({})", sink.index, sink.label);
+        }
+    }
+}
 
-    state.was_playing.store(true, Ordering::Relaxed);
-    *state.playing_players.lock().await = playing_names;
-
-    // 4. Fire-and-forget pause all players
-    match Command::new("playerctl")
-        .args(["--all-players", "pause"])
+async fn set_sink_mute(index: u32, mute: bool) -> bool {
+    let value = if mute { "1" } else { "0" };
+    match Command::new("pactl")
+        .args(["set-sink-mute", &index.to_string(), value])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .output()
+        .await
     {
-        Ok(mut child) => {
-            tokio::spawn(async move {
-                if let Err(e) = child.wait().await {
-                    debug!("playerctl pause exited with error: {e}");
-                }
-            });
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            warn!(
+                "pactl set-sink-mute {index} {value} exited with {}",
+                output.status
+            );
+            false
         }
-        Err(e) => {
-            warn!("failed to spawn playerctl pause: {e}");
-        }
-    }
-}
-
-/// Resume media playback — only for players that were playing at pause time.
-pub async fn resume(state: &MediaState) {
-    // Consume the snapshot before issuing play commands so a second resume call
-    // cannot replay a prior recording's players.
-    let was_playing = state.was_playing.swap(false, Ordering::Relaxed);
-    let players = std::mem::take(&mut *state.playing_players.lock().await);
-
-    if !was_playing || players.is_empty() {
-        return;
-    }
-
-    debug!("resuming: {:?}", players);
-
-    for player_name in &players {
-        match Command::new("playerctl")
-            .args(["--player", player_name.as_str(), "play"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(mut child) => {
-                let name = player_name.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = child.wait().await {
-                        debug!("playerctl play for '{name}' exited with error: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                warn!("failed to spawn playerctl play for '{player_name}': {e}");
-            }
+        Err(error) => {
+            warn!("failed to run pactl set-sink-mute {index} {value}: {error}");
+            false
         }
     }
 }
 
-/// Parse the output of `playerctl --all-players status --format '...'`.
-///
-/// Format is tab-separated: `playerName\tstatus`, one per line.
-/// Example:
-/// ```text
-/// firefox    Paused
-/// spotify    Playing
-/// ```
-fn parse_playing_names(stdout: &str) -> Vec<String> {
-    let mut playing = Vec::new();
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        // Split on tab: "spotify\tPlaying" → ("spotify", "Playing")
-        if let Some(tab) = line.find('\t') {
-            let player = &line[..tab];
-            let status = &line[tab + 1..];
-            if status.eq_ignore_ascii_case("Playing") {
-                playing.push(player.to_string());
-            }
-        }
-    }
-
-    playing
+fn unmuted_sinks(bytes: &[u8]) -> Result<Vec<Sink>, serde_json::Error> {
+    let sinks: Vec<Sink> = serde_json::from_slice(bytes)?;
+    Ok(sinks.into_iter().filter(|sink| !sink.mute).collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_playing_names;
+    use super::unmuted_sinks;
 
     #[test]
-    fn records_only_players_that_are_playing() {
-        let output = "firefox\tPaused\nspotify\tPlaying\nvlc\tStopped\nmpv\tplaying\n";
+    fn selects_only_unmuted_sinks_and_uses_descriptive_labels() {
+        let sinks = unmuted_sinks(
+            br#"[
+                {"index": 42, "name": "alsa_output.one", "description": "Desk speakers", "mute": false},
+                {"index": 7, "name": "alsa_output.two", "description": null, "mute": true},
+                {"index": 9, "name": "bluez_output.headset", "description": "", "mute": false}
+            ]"#,
+        )
+        .unwrap();
 
-        assert_eq!(parse_playing_names(output), ["spotify", "mpv"]);
+        assert_eq!(sinks.len(), 2);
+        assert_eq!(sinks[0].index, 42);
+        assert_eq!(sinks[0].label(), "Desk speakers");
+        assert_eq!(sinks[1].index, 9);
+        assert_eq!(sinks[1].label(), "bluez_output.headset");
+    }
+
+    #[test]
+    fn rejects_invalid_sink_json() {
+        assert!(unmuted_sinks(br#"[{"index":"not-a-number"}]"#).is_err());
     }
 }

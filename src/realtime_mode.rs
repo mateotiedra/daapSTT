@@ -53,7 +53,7 @@ pub(crate) async fn handle_realtime_press(
             Err(e) => {
                 warn!("failed to start recording: {e}");
                 state.cleanup_marker().await;
-                state.resume_media().await;
+                state.restore_recording_audio().await;
                 let _ = notify::error(
                     "Voice daemon",
                     "Failed to start recording — microphone not available?",
@@ -75,8 +75,7 @@ pub(crate) async fn handle_realtime_press(
                 finish_realtime_without_session(config, state, recording_handle).await;
             } else {
                 let _ = recording_handle.stop().await;
-                state.restore_other_mic_apps().await;
-                state.resume_media().await;
+                state.restore_recording_audio().await;
             }
             return;
         }
@@ -89,8 +88,7 @@ pub(crate) async fn handle_realtime_press(
                 finish_realtime_without_session(config, state, recording_handle).await;
             } else {
                 let _ = recording_handle.stop().await;
-                state.restore_other_mic_apps().await;
-                state.resume_media().await;
+                state.restore_recording_audio().await;
             }
             return;
         }
@@ -131,15 +129,15 @@ pub(crate) async fn handle_realtime_press(
     }
 
     let audio_result = recording_handle.stop().await;
-    state.restore_other_mic_apps().await;
+    state.restore_recording_audio().await;
     if !keyboard_safe {
-        state.resume_media().await;
+        state.restore_recording_audio().await;
         return;
     }
     if release_started && !crate::wait_for_release_completion(hotkey_rx).await {
         // The hotkey's modifier state is unknown, so never touch live text or
         // the marker through wtype.
-        state.resume_media().await;
+        state.restore_recording_audio().await;
         return;
     }
     let audio_data = match audio_result {
@@ -148,7 +146,7 @@ pub(crate) async fn handle_realtime_press(
             warn!("audio capture error: {e}");
             cleanup_live_tail(&mut live_text, tail_safe).await;
             state.cleanup_marker().await;
-            state.resume_media().await;
+            state.restore_recording_audio().await;
             let _ = notify::error("Voice daemon", "Audio capture failed").await;
             return;
         }
@@ -201,7 +199,7 @@ async fn finish_realtime_without_session(
     recording_handle: audio::RecordingHandle,
 ) {
     let audio_result = recording_handle.stop().await;
-    state.restore_other_mic_apps().await;
+    state.restore_recording_audio().await;
     match audio_result {
         Ok(audio_data) => {
             finish_realtime_result(
@@ -217,7 +215,7 @@ async fn finish_realtime_without_session(
         Err(e) => {
             warn!("audio capture error: {e}");
             state.cleanup_marker().await;
-            state.resume_media().await;
+            state.restore_recording_audio().await;
             let _ = notify::error("Voice daemon", "Audio capture failed").await;
         }
     }
@@ -352,7 +350,7 @@ async fn finish_realtime_result(
             )
             .await;
         }
-        state.resume_media().await;
+        state.restore_recording_audio().await;
         return;
     }
     match realtime_next_step(
@@ -371,7 +369,7 @@ async fn finish_realtime_result(
                     realtime_error_notification(failed.as_ref().expect("failure required")),
                 )
                 .await;
-                state.resume_media().await;
+                state.restore_recording_audio().await;
             }
         }
         RealtimeNextStep::NotifyFailure => {
@@ -382,12 +380,12 @@ async fn finish_realtime_result(
                 realtime_error_notification(failed.as_ref().expect("failure required")),
             )
             .await;
-            state.resume_media().await;
+            state.restore_recording_audio().await;
         }
         RealtimeNextStep::Done => {
             cleanup_live_tail(&mut live_text, tail_safe).await;
             state.cleanup_marker().await;
-            state.resume_media().await;
+            state.restore_recording_audio().await;
         }
     }
 }

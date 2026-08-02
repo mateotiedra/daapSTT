@@ -17,7 +17,7 @@ Alt+Space held ──► § marker appears ──► you speak ──► release
 - **Linux** with Wayland (tested on Hyprland)
 - **PipeWire** for audio capture
 - **wtype**, **pw-record**, **notify-send**, **keyd**, and **wl-clipboard** (`wl-paste`) installed
-- **pactl** for per-app microphone privacy and **playerctl** for automatic media pause (either feature degrades to a no-op if its command is unavailable)
+- **pactl** for temporary output muting and per-app microphone privacy (both features degrade to a no-op if PipeWire's PulseAudio compatibility layer is unavailable)
 - **keyd** enabled and configured in its existing `/etc/keyd/default.conf` (see Quick Start)
 - **input** group membership for `/dev/input/event*` access
 - An [ElevenLabs API key](https://elevenlabs.io/app/settings/api-keys)
@@ -65,7 +65,9 @@ journalctl --user -u voice-daemon -f
 
 Batch transcription is the default. In both Batch and Realtime modes, the user hotkey remains **hold Alt+Space and release it to stop**. `F24` is only keyd's internal normalized signal; it is not a second user-facing hotkey.
 
-While the hotkey is held, the daemon uses PipeWire's PulseAudio compatibility layer (`pactl`) to mute other apps' currently active microphone capture streams. This prevents Discord, browsers, and call apps from receiving your dictation while leaving the physical microphone available to daapSTT. Streams that capture system/monitor audio are ignored, streams that were already muted stay muted, and streams muted by daapSTT are restored as soon as recording stops—before transcription finishes. This does not toggle the mute control inside Discord or other apps.
+While the hotkey is held, the daemon uses PipeWire's PulseAudio compatibility layer (`pactl`) to mute every available audio output that was not already muted. This silences Spotify, YouTube, Discord, and new playback routed to those outputs without pausing or changing playback position. Outputs that were already muted stay muted, and only outputs successfully muted by daapSTT are restored as soon as recording stops—before transcription finishes. A new output device that appears mid-dictation is not part of the initial snapshot.
+
+The daemon also mutes other apps' currently active microphone capture streams while the hotkey is held. This prevents Discord, browsers, and call apps from receiving your dictation while leaving the physical microphone available to daapSTT. Streams that capture system/monitor audio are ignored, streams that were already muted stay muted, and streams muted by daapSTT are restored as soon as recording stops. This does not toggle the mute control inside Discord or other apps.
 
 Speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. Text is wrapped in double quotes, while images get one space before and after. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. In Realtime mode, paste happens when recognition becomes a stable committed segment, before the hotkey is released. Batch mode necessarily waits for the provider transcription result, but pastes immediately once `banana` is recognized.
 
@@ -119,7 +121,7 @@ Set these variables in `~/.config/voice-daemon/env`:
 | `VOICE_MARKER_CHAR` | `§` | Recording indicator character |
 | `VOICE_MAX_RECORDING_SECS` | `60` | Maximum recording duration |
 | `VOICE_RECORD_TARGET` | *(default source)* | Optional PipeWire target node ID for `pw-record` |
-| `VOICE_PAUSE_MEDIA` | `true` | Pause active MPRIS media during dictation; set to `false` to disable |
+| `VOICE_MUTE_AUDIO_OUTPUTS` | `true` | Mute all available audio outputs during dictation; set to `false` to disable |
 | `VOICE_MUTE_OTHER_MIC_APPS` | `true` | Mute other apps' active microphone streams during dictation; set to `false` to disable |
 | `VOICE_KEYTERMS_FILE` | `~/.config/voice-daemon/keyterms.txt` | File containing one keyterm per line; keyterm commands use this path |
 
