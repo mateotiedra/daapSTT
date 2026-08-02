@@ -86,10 +86,17 @@ fn backspace_args(backspaces: usize) -> Vec<&'static str> {
 }
 
 fn paste_args(shortcut: PasteShortcut) -> &'static [&'static str] {
+    // Keep modifiers held long enough for the compositor and target client to
+    // observe them before V, then release them only after the key-up event has
+    // been dispatched. A single immediate `-k v` can exit successfully while
+    // the application silently misses the shortcut.
     match shortcut {
-        PasteShortcut::CtrlV => &["-M", "ctrl", "-k", "v", "-m", "ctrl"],
+        PasteShortcut::CtrlV => &[
+            "-M", "ctrl", "-s", "100", "-P", "v", "-p", "v", "-s", "100", "-m", "ctrl",
+        ],
         PasteShortcut::CtrlShiftV => &[
-            "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl",
+            "-M", "ctrl", "-M", "shift", "-s", "100", "-P", "v", "-p", "v", "-s", "100", "-m",
+            "shift", "-m", "ctrl",
         ],
     }
 }
@@ -151,11 +158,14 @@ mod tests {
     fn native_paste_command_sequences_are_exact() {
         assert_eq!(
             paste_args(PasteShortcut::CtrlV),
-            ["-M", "ctrl", "-k", "v", "-m", "ctrl"]
+            ["-M", "ctrl", "-s", "100", "-P", "v", "-p", "v", "-s", "100", "-m", "ctrl"]
         );
         assert_eq!(
             paste_args(PasteShortcut::CtrlShiftV),
-            ["-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"]
+            [
+                "-M", "ctrl", "-M", "shift", "-s", "100", "-P", "v", "-p", "v", "-s", "100", "-m",
+                "shift", "-m", "ctrl"
+            ]
         );
     }
 
