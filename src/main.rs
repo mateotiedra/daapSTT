@@ -16,6 +16,7 @@ mod realtime;
 mod realtime_mode;
 mod transcribe;
 mod transcript;
+mod window;
 
 use anyhow::Result;
 use log::{error, info, warn};
@@ -190,16 +191,22 @@ fn usage() -> &'static str {
     "Usage:\n  daapstt                 Start the voice daemon\n  daapstt keyterms        Manage keyterms interactively\n  daapstt keyterms list\n  daapstt keyterms add <term>\n  daapstt keyterms remove <term>\n  daapstt realtime on|off|status"
 }
 
-pub(crate) async fn begin_recording(config: &config::Config, state: &mut RecordingState) -> bool {
+pub(crate) async fn begin_recording(
+    config: &config::Config,
+    state: &mut RecordingState,
+    show_marker: bool,
+) -> bool {
     if config.mute_audio_outputs {
         media::mute_unmuted_outputs(&mut state.output_mute_state).await;
     }
-    if let Err(e) = deliver::type_marker(&state.marker_char).await {
-        warn!("failed to type marker: {e}");
-        state.restore_recording_audio().await;
-        return false;
+    if show_marker {
+        if let Err(e) = deliver::type_marker(&state.marker_char).await {
+            warn!("failed to type marker: {e}");
+            state.restore_recording_audio().await;
+            return false;
+        }
+        state.marker_active = true;
     }
-    state.marker_active = true;
     if config.mute_other_mic_apps {
         // Snapshot before spawning our own pw-record stream so only other apps
         // are muted and the physical microphone remains available to daapSTT.
@@ -215,7 +222,7 @@ async fn handle_batch_press(
     hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
 ) {
     info!("recording started");
-    if !begin_recording(config, state).await {
+    if !begin_recording(config, state, true).await {
         return;
     }
     let max_dur = Duration::from_secs(config.max_recording_secs);

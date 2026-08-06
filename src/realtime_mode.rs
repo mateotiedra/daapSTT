@@ -12,6 +12,13 @@ use crate::{
     RecordingState,
 };
 
+use deferred::{
+    accumulate_committed_text, deliver_transcript as deliver_deferred_transcript,
+    wait_for_delivery_safety, RealtimeDelivery,
+};
+
+mod deferred;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RealtimeNextStep {
     Done,
@@ -41,8 +48,14 @@ pub(crate) async fn handle_realtime_press(
     state: &mut RecordingState,
     hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
 ) {
-    info!("realtime recording started");
-    if !crate::begin_recording(config, state).await {
+    let delivery = if crate::window::active_is_discord().await {
+        info!("realtime recording started with deferred Discord delivery");
+        RealtimeDelivery::Deferred
+    } else {
+        info!("realtime recording started");
+        RealtimeDelivery::Live
+    };
+    if !crate::begin_recording(config, state, !delivery.is_deferred()).await {
         return;
     }
     let max_dur = Duration::from_secs(config.max_recording_secs);
@@ -71,8 +84,8 @@ pub(crate) async fn handle_realtime_press(
         },
         Err(e) => {
             warn!("failed to load realtime keyterms: {e}");
-            if wait_for_release(max_dur, hotkey_rx).await {
-                finish_realtime_without_session(config, state, recording_handle).await;
+            if wait_for_release(max_dur, hotkey_rx, !delivery.is_deferred()).await {
+                finish_realtime_without_session(config, state, recording_handle, delivery).await;
             } else {
                 let _ = recording_handle.stop().await;
                 state.restore_recording_audio().await;
@@ -84,8 +97,8 @@ pub(crate) async fn handle_realtime_press(
         Ok(session) => session,
         Err(e) => {
             warn!("failed to start realtime session: {e}");
-            if wait_for_release(max_dur, hotkey_rx).await {
-                finish_realtime_without_session(config, state, recording_handle).await;
+            if wait_for_release(max_dur, hotkey_rx, !delivery.is_deferred()).await {
+                finish_realtime_without_session(config, state, recording_handle, delivery).await;
             } else {
                 let _ = recording_handle.stop().await;
                 state.restore_recording_audio().await;
@@ -121,7 +134,14 @@ pub(crate) async fn handle_realtime_press(
                 }
             },
             event = session.recv(), if session_open => match event {
-                Some(event) => process_realtime_event(event, state, &mut live_text, &mut failed, &mut tail_safe).await,
+                Some(event) => process_realtime_event(
+                    event,
+                    state,
+                    &mut live_text,
+                    &mut failed,
+                    &mut tail_safe,
+                    delivery,
+                ).await,
                 None => { session_open = false; if failed.is_none() { failed = Some(realtime::RealtimeError::TaskFailed); } }
             },
             _ = &mut timer => { info!("max recording duration ({}s) reached — auto-stopping", config.max_recording_secs); break; }
@@ -134,7 +154,7 @@ pub(crate) async fn handle_realtime_press(
         state.restore_recording_audio().await;
         return;
     }
-    if release_started && !crate::wait_for_release_completion(hotkey_rx).await {
+    if !wait_for_delivery_safety(delivery, release_started, hotkey_rx).await {
         // The hotkey's modifier state is unknown, so never touch live text or
         // the marker through wtype.
         state.restore_recording_audio().await;
@@ -144,7 +164,7 @@ pub(crate) async fn handle_realtime_press(
         Ok(audio) => audio,
         Err(e) => {
             warn!("audio capture error: {e}");
-            cleanup_live_tail(&mut live_text, tail_safe).await;
+            cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
             state.cleanup_marker().await;
             state.restore_recording_audio().await;
             let _ = notify::error("Voice daemon", "Audio capture failed").await;
@@ -164,13 +184,23 @@ pub(crate) async fn handle_realtime_press(
             // finalization would be inserted and immediately removed by cleanup.
             Some(event) if !process_during_finalization(&event) => {}
             Some(event) => {
-                process_realtime_event(event, state, &mut live_text, &mut failed, &mut tail_safe)
-                    .await
+                process_realtime_event(
+                    event,
+                    state,
+                    &mut live_text,
+                    &mut failed,
+                    &mut tail_safe,
+                    delivery,
+                )
+                .await
             }
             None => session_open = false,
         }
     }
-    finish_realtime_result(config, state, audio_data, live_text, failed, tail_safe).await;
+    finish_realtime_result(
+        config, state, audio_data, live_text, failed, tail_safe, delivery,
+    )
+    .await;
 }
 
 fn process_during_finalization(event: &realtime::RealtimeEvent) -> bool {
@@ -182,13 +212,14 @@ fn process_during_finalization(event: &realtime::RealtimeEvent) -> bool {
 async fn wait_for_release(
     max_dur: Duration,
     hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
+    allow_timeout_completion: bool,
 ) -> bool {
     match tokio::time::timeout(max_dur, crate::wait_for_release_started(hotkey_rx)).await {
         Ok(crate::ReleaseStart::Started) => crate::wait_for_release_completion(hotkey_rx).await,
         Ok(crate::ReleaseStart::ChannelClosed) => false,
         Err(_) => {
             info!("max recording duration reached — auto-stopping");
-            true
+            allow_timeout_completion
         }
     }
 }
@@ -197,6 +228,7 @@ async fn finish_realtime_without_session(
     config: &config::Config,
     state: &mut RecordingState,
     recording_handle: audio::RecordingHandle,
+    delivery: RealtimeDelivery,
 ) {
     let audio_result = recording_handle.stop().await;
     state.restore_recording_audio().await;
@@ -209,6 +241,7 @@ async fn finish_realtime_without_session(
                 LiveText::new(),
                 Some(realtime::RealtimeError::TaskFailed),
                 true,
+                delivery,
             )
             .await
         }
@@ -227,6 +260,7 @@ async fn process_realtime_event(
     live_text: &mut LiveText,
     failed: &mut Option<realtime::RealtimeError>,
     tail_safe: &mut bool,
+    delivery: RealtimeDelivery,
 ) {
     match event {
         realtime::RealtimeEvent::SessionStarted | realtime::RealtimeEvent::Completed => {}
@@ -235,7 +269,7 @@ async fn process_realtime_event(
             *failed = Some(error);
         }
         realtime::RealtimeEvent::PartialTranscript(text) => {
-            if failed.is_none() {
+            if failed.is_none() && !delivery.is_deferred() {
                 let text = crate::transcript::clean(&text);
                 apply_live_text(state, live_text, &text, false, failed, tail_safe).await;
             }
@@ -243,7 +277,11 @@ async fn process_realtime_event(
         realtime::RealtimeEvent::CommittedTranscript(text) => {
             if failed.is_none() {
                 let text = crate::transcript::clean(&text);
-                apply_live_text(state, live_text, &text, true, failed, tail_safe).await;
+                if delivery.is_deferred() {
+                    accumulate_committed_text(live_text, &text);
+                } else {
+                    apply_live_text(state, live_text, &text, true, failed, tail_safe).await;
+                }
             }
         }
     }
@@ -312,7 +350,14 @@ fn raw_committed_segment(already_committed: bool, text: &str) -> String {
     }
 }
 
-async fn cleanup_live_tail(live_text: &mut LiveText, tail_safe: bool) -> bool {
+async fn cleanup_live_tail(
+    live_text: &mut LiveText,
+    tail_safe: bool,
+    delivery: RealtimeDelivery,
+) -> bool {
+    if delivery.is_deferred() {
+        return true;
+    }
     if !tail_safe {
         return false;
     }
@@ -337,11 +382,12 @@ async fn finish_realtime_result(
     mut live_text: LiveText,
     failed: Option<realtime::RealtimeError>,
     tail_safe: bool,
+    delivery: RealtimeDelivery,
 ) {
     let usable_audio =
         audio_data.data.len() >= 800 && !audio::is_silence(audio_data.peak_amplitude);
     if !usable_audio {
-        cleanup_live_tail(&mut live_text, tail_safe).await;
+        cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
         state.cleanup_marker().await;
         if audio::is_silence(audio_data.peak_amplitude) && audio_data.data.len() >= 800 {
             let _ = notify::error(
@@ -360,7 +406,7 @@ async fn finish_realtime_result(
         usable_audio,
     ) {
         RealtimeNextStep::FallbackBatch => {
-            if cleanup_live_tail(&mut live_text, tail_safe).await {
+            if cleanup_live_tail(&mut live_text, tail_safe, delivery).await {
                 transcribe_batch(config, state, audio_data).await;
             } else {
                 state.cleanup_marker().await;
@@ -373,7 +419,10 @@ async fn finish_realtime_result(
             }
         }
         RealtimeNextStep::NotifyFailure => {
-            cleanup_live_tail(&mut live_text, tail_safe).await;
+            cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
+            if delivery.is_deferred() {
+                deliver_deferred_transcript(&live_text).await;
+            }
             state.cleanup_marker().await;
             let _ = notify::error(
                 "Voice daemon",
@@ -383,7 +432,10 @@ async fn finish_realtime_result(
             state.restore_recording_audio().await;
         }
         RealtimeNextStep::Done => {
-            cleanup_live_tail(&mut live_text, tail_safe).await;
+            cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
+            if delivery.is_deferred() {
+                deliver_deferred_transcript(&live_text).await;
+            }
             state.cleanup_marker().await;
             state.restore_recording_audio().await;
         }

@@ -44,19 +44,39 @@ pub async fn apply_realtime_edit(backspaces: usize, text: &str) -> Result<()> {
 
 /// Type plain transcript text into the active window.
 pub async fn type_text(text: &str) -> Result<()> {
+    type_text_with_delay(text, None).await
+}
+
+/// Type transcript text with a target-specific delay between key events.
+pub async fn type_text_paced(text: &str, delay_ms: u64) -> Result<()> {
+    type_text_with_delay(text, Some(delay_ms)).await
+}
+
+async fn type_text_with_delay(text: &str, delay_ms: Option<u64>) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     debug!("typing transcript");
-    type_with_wtype(text, "text").await
+    type_with_wtype_delay(text, "text", delay_ms).await
 }
 
 /// Delivers transcript chunks in order, pasting the native clipboard at each
 /// placeholder without reading or logging its payload.
 pub async fn deliver_chunks(chunks: &[TranscriptChunk<'_>]) -> Result<()> {
+    deliver_chunks_with_delay(chunks, None).await
+}
+
+pub async fn deliver_chunks_paced(chunks: &[TranscriptChunk<'_>], delay_ms: u64) -> Result<()> {
+    deliver_chunks_with_delay(chunks, Some(delay_ms)).await
+}
+
+async fn deliver_chunks_with_delay(
+    chunks: &[TranscriptChunk<'_>],
+    delay_ms: Option<u64>,
+) -> Result<()> {
     for (index, chunk) in chunks.iter().enumerate() {
         match chunk {
-            TranscriptChunk::Literal(text) => type_text(text).await?,
+            TranscriptChunk::Literal(text) => type_text_with_delay(text, delay_ms).await?,
             TranscriptChunk::ClipboardPlaceholder => {
                 let has_space_before = chunks[..index].last().is_some_and(|chunk| {
                     matches!(chunk, TranscriptChunk::Literal(text) if text.ends_with(char::is_whitespace))
@@ -64,19 +84,23 @@ pub async fn deliver_chunks(chunks: &[TranscriptChunk<'_>]) -> Result<()> {
                 let has_space_after = chunks[index + 1..].first().is_some_and(|chunk| {
                     matches!(chunk, TranscriptChunk::Literal(text) if text.starts_with(char::is_whitespace))
                 });
-                paste_clipboard(has_space_before, has_space_after).await?;
+                paste_clipboard(has_space_before, has_space_after, delay_ms).await?;
             }
         }
     }
     Ok(())
 }
 
-async fn paste_clipboard(has_space_before: bool, has_space_after: bool) -> Result<()> {
+async fn paste_clipboard(
+    has_space_before: bool,
+    has_space_after: bool,
+    delay_ms: Option<u64>,
+) -> Result<()> {
     let plan = clipboard::paste_plan().await;
     let (before, after) = paste_delimiters(plan, has_space_before, has_space_after);
-    type_text(before).await?;
+    type_text_with_delay(before, delay_ms).await?;
     run_wtype(paste_args(plan.shortcut), "native paste").await?;
-    type_text(after).await
+    type_text_with_delay(after, delay_ms).await
 }
 
 fn paste_delimiters(
@@ -117,9 +141,22 @@ fn paste_args(shortcut: PasteShortcut) -> &'static [&'static str] {
 }
 
 async fn type_with_wtype(text: &str, operation: &str) -> Result<()> {
+    type_with_wtype_delay(text, operation, None).await
+}
+
+async fn type_with_wtype_delay(text: &str, operation: &str, delay_ms: Option<u64>) -> Result<()> {
     let mut command = Command::new("wtype");
-    command.arg("-").stdin(std::process::Stdio::piped());
+    command
+        .args(type_args(delay_ms))
+        .stdin(std::process::Stdio::piped());
     run_command_with_text(command, text, operation).await
+}
+
+fn type_args(delay_ms: Option<u64>) -> Vec<String> {
+    match delay_ms {
+        Some(delay_ms) => vec!["-d".into(), delay_ms.to_string(), "-".into()],
+        None => vec!["-".into()],
+    }
 }
 
 async fn run_wtype(args: &[&str], operation: &str) -> Result<()> {
@@ -209,6 +246,12 @@ mod tests {
             ),
             ("\"", "\"")
         );
+    }
+
+    #[test]
+    fn transcript_typing_has_exactly_one_stdin_placeholder() {
+        assert_eq!(type_args(None), ["-"]);
+        assert_eq!(type_args(Some(3)), ["-d", "3", "-"]);
     }
 
     #[test]

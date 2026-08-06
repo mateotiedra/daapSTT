@@ -71,7 +71,7 @@ The daemon also mutes other apps' currently active microphone capture streams wh
 
 Speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. Text is wrapped in double quotes, while images get one space before and after. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. In Realtime mode, paste happens when recognition becomes a stable committed segment, before the hotkey is released. Batch mode necessarily waits for the provider transcription result, but pastes immediately once `banana` is recognized.
 
-Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds:
+Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. The native Discord client is handled specially: no marker or partial text is injected while Alt+Space is held, and the stable transcript is delivered once after Alt is fully released. This avoids Discord interpreting synthetic edits as modifier shortcuts.
 
 ```bash
 daapstt realtime on      # Enable realtime and restart the user service

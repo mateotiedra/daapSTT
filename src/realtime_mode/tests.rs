@@ -60,7 +60,7 @@ async fn fallback_wait_requires_both_release_phases() {
         .await
         .unwrap();
 
-    assert!(wait_for_release(Duration::from_secs(1), &mut rx).await);
+    assert!(wait_for_release(Duration::from_secs(1), &mut rx, true).await);
 }
 
 #[tokio::test]
@@ -68,7 +68,7 @@ async fn fallback_wait_fails_closed_when_hotkey_channel_closes() {
     let (tx, mut rx) = mpsc::channel(1);
     drop(tx);
 
-    assert!(!wait_for_release(Duration::from_secs(1), &mut rx).await);
+    assert!(!wait_for_release(Duration::from_secs(1), &mut rx, true).await);
 }
 
 #[tokio::test]
@@ -77,7 +77,14 @@ async fn fallback_wait_fails_closed_when_completion_channel_closes() {
     tx.send(hotkey::HotkeyEvent::ReleaseStarted).await.unwrap();
     drop(tx);
 
-    assert!(!wait_for_release(Duration::from_secs(1), &mut rx).await);
+    assert!(!wait_for_release(Duration::from_secs(1), &mut rx, true).await);
+}
+
+#[tokio::test]
+async fn deferred_timeout_never_claims_keyboard_safety() {
+    let (_tx, mut rx) = mpsc::channel(1);
+
+    assert!(!wait_for_release(Duration::ZERO, &mut rx, false).await);
 }
 
 #[test]

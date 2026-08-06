@@ -41,8 +41,8 @@ impl LiveText {
         self.committed_any
     }
 
-    #[cfg(test)]
-    fn committed_text(&self) -> &str {
+    /// The complete stable transcript accumulated from committed segments.
+    pub fn committed_text(&self) -> &str {
         &self.committed_text
     }
 
