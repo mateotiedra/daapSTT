@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn discord_and_unknown_windows_use_safe_deferred_delivery() {
+    assert_eq!(
+        delivery_for_active_class(Some("discord")),
+        RealtimeDelivery::Deferred
+    );
+    assert_eq!(
+        delivery_for_active_class(Some("DiScOrD")),
+        RealtimeDelivery::Deferred
+    );
+    assert_eq!(delivery_for_active_class(None), RealtimeDelivery::Deferred);
+    assert_eq!(
+        delivery_for_active_class(Some("firefox")),
+        RealtimeDelivery::Live
+    );
+}
+
+#[test]
 fn fallback_happens_after_a_provider_failure_before_any_commit() {
     assert_eq!(
         realtime_next_step(false, true, true, true),
