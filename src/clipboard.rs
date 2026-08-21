@@ -20,9 +20,9 @@ pub struct PastePlan {
 ///
 /// Image clipboard data always uses the standard paste shortcut and space
 /// delimiters. For non-image data, Kitty's terminal paste shortcut is used only
-/// when the active window class is exactly `kitty`, ignoring ASCII case. All
-/// missing or invalid probe data deliberately falls back to text with Ctrl+V.
-pub fn select_paste_plan(clipboard_types: &str, active_window: Option<&str>) -> PastePlan {
+/// when the active window class is exactly `kitty`, ignoring ASCII case. A
+/// missing active window class deliberately falls back to text with Ctrl+V.
+pub fn select_paste_plan(clipboard_types: &str, active_class: Option<&str>) -> PastePlan {
     if clipboard_types
         .lines()
         .any(|mime_type| mime_type.trim().starts_with("image/"))
@@ -33,10 +33,7 @@ pub fn select_paste_plan(clipboard_types: &str, active_window: Option<&str>) -> 
         };
     }
 
-    let is_kitty = active_window
-        .and_then(|window| serde_json::from_str::<serde_json::Value>(window).ok())
-        .and_then(|window| window.get("class")?.as_str().map(str::to_owned))
-        .is_some_and(|class| class.eq_ignore_ascii_case("kitty"));
+    let is_kitty = active_class.is_some_and(|class| class.eq_ignore_ascii_case("kitty"));
 
     PastePlan {
         shortcut: if is_kitty {
@@ -72,15 +69,8 @@ pub async fn paste_plan() -> PastePlan {
         };
     }
 
-    let active_window = match Command::new("hyprctl")
-        .args(["-j", "activewindow"])
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => String::from_utf8(output.stdout).ok(),
-        _ => None,
-    };
-    select_paste_plan(&clipboard_types, active_window.as_deref())
+    let active_class = crate::window::active_class().await;
+    select_paste_plan(&clipboard_types, active_class.as_deref())
 }
 
 #[cfg(test)]
@@ -90,7 +80,7 @@ mod tests {
     #[test]
     fn image_mime_has_priority_over_kitty() {
         assert_eq!(
-            select_paste_plan("text/plain\nimage/png\n", Some(r#"{"class":"kitty"}"#)),
+            select_paste_plan("text/plain\nimage/png\n", Some("kitty")),
             PastePlan {
                 shortcut: PasteShortcut::CtrlV,
                 is_image: true,
@@ -101,14 +91,14 @@ mod tests {
     #[test]
     fn only_exact_kitty_class_uses_terminal_paste() {
         assert_eq!(
-            select_paste_plan("text/plain", Some(r#"{"class":"KiTtY"}"#)),
+            select_paste_plan("text/plain", Some("KiTtY")),
             PastePlan {
                 shortcut: PasteShortcut::CtrlShiftV,
                 is_image: false,
             }
         );
         assert_eq!(
-            select_paste_plan("text/plain", Some(r#"{"class":"kitty-terminal"}"#)),
+            select_paste_plan("text/plain", Some("kitty-terminal")),
             PastePlan {
                 shortcut: PasteShortcut::CtrlV,
                 is_image: false,
@@ -117,20 +107,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_missing_probe_data_falls_back() {
-        assert_eq!(
-            select_paste_plan("text/plain", None),
-            PastePlan {
-                shortcut: PasteShortcut::CtrlV,
-                is_image: false,
-            }
-        );
-        assert_eq!(
-            select_paste_plan("text/plain", Some("not json")),
-            PastePlan {
-                shortcut: PasteShortcut::CtrlV,
-                is_image: false,
-            }
-        );
+    fn missing_or_non_kitty_active_class_falls_back() {
+        for active_class in [None, Some("firefox")] {
+            assert_eq!(
+                select_paste_plan("text/plain", active_class),
+                PastePlan {
+                    shortcut: PasteShortcut::CtrlV,
+                    is_image: false,
+                }
+            );
+        }
     }
 }
