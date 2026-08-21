@@ -63,24 +63,36 @@ async fn type_text_with_delay(text: &str, delay_ms: Option<u64>) -> Result<()> {
 /// Delivers transcript chunks in order, pasting the native clipboard at each
 /// placeholder without reading or logging its payload.
 pub async fn deliver_chunks(chunks: &[TranscriptChunk<'_>]) -> Result<()> {
-    deliver_chunks_with_delay(chunks, None).await
+    deliver_chunks_with_delay(chunks, None, false).await
+}
+
+/// Delivers chunks after text that remains immediately before them.
+pub async fn deliver_chunks_after_text(
+    chunks: &[TranscriptChunk<'_>],
+    has_space_before: bool,
+) -> Result<()> {
+    deliver_chunks_with_delay(chunks, None, has_space_before).await
 }
 
 pub async fn deliver_chunks_paced(chunks: &[TranscriptChunk<'_>], delay_ms: u64) -> Result<()> {
-    deliver_chunks_with_delay(chunks, Some(delay_ms)).await
+    deliver_chunks_with_delay(chunks, Some(delay_ms), false).await
 }
 
 async fn deliver_chunks_with_delay(
     chunks: &[TranscriptChunk<'_>],
     delay_ms: Option<u64>,
+    initial_has_space_before: bool,
 ) -> Result<()> {
     for (index, chunk) in chunks.iter().enumerate() {
         match chunk {
             TranscriptChunk::Literal(text) => type_text_with_delay(text, delay_ms).await?,
             TranscriptChunk::ClipboardPlaceholder => {
-                let has_space_before = chunks[..index].last().is_some_and(|chunk| {
-                    matches!(chunk, TranscriptChunk::Literal(text) if text.ends_with(char::is_whitespace))
-                });
+                let has_space_before = chunks[..index].last().map_or(
+                    initial_has_space_before,
+                    |chunk| {
+                        matches!(chunk, TranscriptChunk::Literal(text) if text.ends_with(char::is_whitespace))
+                    },
+                );
                 let has_space_after = chunks[index + 1..].first().is_some_and(|chunk| {
                     matches!(chunk, TranscriptChunk::Literal(text) if text.starts_with(char::is_whitespace))
                 });

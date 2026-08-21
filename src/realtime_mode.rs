@@ -338,16 +338,21 @@ async fn apply_live_text(
         return;
     }
 
-    // The raw committed segment is still at the cursor. Remove only that
-    // segment, then redeliver its literals and native clipboard pastes. The
-    // LiveText state remains raw so pasted content is never revisited later.
-    if let Err(e) = deliver::apply_realtime_edit(segment.graphemes(true).count(), "").await {
+    // The raw committed segment is still at the cursor. Preserve its literal
+    // prefix, remove only the tail starting at the first placeholder, then
+    // redeliver that tail. The LiveText state remains raw so pasted content is
+    // never revisited later.
+    let (backspaces, replacement_start, has_space_before) =
+        clipboard_replacement_plan(&segment, &chunks);
+    if let Err(e) = deliver::apply_realtime_edit(backspaces, "").await {
         warn!("failed to prepare realtime clipboard paste: {e}");
         *failed = Some(realtime::RealtimeError::TaskFailed);
         *tail_safe = false;
         return;
     }
-    if let Err(e) = deliver::deliver_chunks(&chunks).await {
+    if let Err(e) =
+        deliver::deliver_chunks_after_text(&chunks[replacement_start..], has_space_before).await
+    {
         warn!("failed to deliver realtime clipboard paste: {e}");
         *failed = Some(realtime::RealtimeError::TaskFailed);
         *tail_safe = false;
@@ -360,6 +365,35 @@ fn raw_committed_segment(already_committed: bool, text: &str) -> String {
     } else {
         text.to_owned()
     }
+}
+
+/// Returns the number of graphemes to remove, the first chunk to redeliver,
+/// and whether preserved text ends in whitespace.
+fn clipboard_replacement_plan(
+    segment: &str,
+    chunks: &[placeholder::TranscriptChunk<'_>],
+) -> (usize, usize, bool) {
+    let replacement_start = chunks
+        .iter()
+        .position(|chunk| matches!(chunk, placeholder::TranscriptChunk::ClipboardPlaceholder))
+        .expect("clipboard replacement requires a placeholder");
+    let preserved = &chunks[..replacement_start];
+    let preserved_graphemes = preserved
+        .iter()
+        .map(|chunk| match chunk {
+            placeholder::TranscriptChunk::Literal(text) => text.graphemes(true).count(),
+            placeholder::TranscriptChunk::ClipboardPlaceholder => 0,
+        })
+        .sum::<usize>();
+    let has_space_before = preserved.last().is_some_and(|chunk| {
+        matches!(chunk, placeholder::TranscriptChunk::Literal(text) if text.ends_with(char::is_whitespace))
+    });
+
+    (
+        segment.graphemes(true).count() - preserved_graphemes,
+        replacement_start,
+        has_space_before,
+    )
 }
 
 async fn cleanup_live_tail(

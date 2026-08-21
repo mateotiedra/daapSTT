@@ -54,19 +54,15 @@ fn success_or_unusable_audio_needs_no_fallback() {
 }
 
 #[test]
-fn placeholder_commit_backspaces_the_full_raw_segment() {
-    assert_eq!(
-        raw_committed_segment(false, "banana")
-            .graphemes(true)
-            .count(),
-        6
-    );
-    assert_eq!(
-        raw_committed_segment(true, "a\u{301} banana")
-            .graphemes(true)
-            .count(),
-        9
-    );
+fn placeholder_commit_preserves_the_prefix_before_banana() {
+    let segment = raw_committed_segment(false, "prefix banana suffix");
+    let chunks = placeholder::parse_banana_chunks(&segment);
+
+    assert_eq!(clipboard_replacement_plan(&segment, &chunks), (13, 1, true));
+
+    let segment = raw_committed_segment(true, "a\u{301} banana");
+    let chunks = placeholder::parse_banana_chunks(&segment);
+    assert_eq!(clipboard_replacement_plan(&segment, &chunks), (6, 1, true));
 }
 
 #[tokio::test]
