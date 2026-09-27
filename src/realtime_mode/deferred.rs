@@ -11,6 +11,7 @@ const DEFERRED_KEY_DELAY_MS: u64 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RealtimeDelivery {
     Live,
+    Ime,
     Deferred,
 }
 
@@ -25,10 +26,13 @@ pub(super) async fn wait_for_delivery_safety(
     release_started: bool,
     hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
 ) -> bool {
+    if delivery == RealtimeDelivery::Ime {
+        return true;
+    }
     if release_started {
         return crate::wait_for_release_completion(hotkey_rx).await;
     }
-    if !delivery.is_deferred() {
+    if delivery == RealtimeDelivery::Live {
         return true;
     }
     match crate::wait_for_release_started(hotkey_rx).await {
@@ -90,5 +94,12 @@ mod tests {
         let (_tx, mut rx) = mpsc::channel(1);
 
         assert!(wait_for_delivery_safety(RealtimeDelivery::Live, false, &mut rx).await);
+    }
+
+    #[tokio::test]
+    async fn ime_delivery_never_waits_for_alt_release_completion() {
+        let (_tx, mut rx) = mpsc::channel(1);
+
+        assert!(wait_for_delivery_safety(RealtimeDelivery::Ime, true, &mut rx).await);
     }
 }

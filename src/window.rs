@@ -91,6 +91,21 @@ pub fn is_discord_class(class: Option<&str>) -> bool {
     class.is_some_and(|class| class.eq_ignore_ascii_case("discord"))
 }
 
+/// Whether a window class identifies a supported Chrome or Chromium browser.
+pub fn is_chrome_class(class: Option<&str>) -> bool {
+    class.is_some_and(|class| {
+        [
+            "google-chrome",
+            "google-chrome-beta",
+            "google-chrome-unstable",
+            "chromium",
+            "chromium-browser",
+        ]
+        .iter()
+        .any(|candidate| class.eq_ignore_ascii_case(candidate))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +173,22 @@ mod tests {
         assert!(!is_discord_class(Some("discord-canary")));
         assert!(!is_discord_class(Some("vesktop")));
         assert!(!is_discord_class(None));
+    }
+
+    #[test]
+    fn chrome_matching_is_exact_and_ascii_case_insensitive() {
+        for class in [
+            "google-chrome",
+            "GOOGLE-CHROME-BETA",
+            "Google-Chrome-Unstable",
+            "chromium",
+            "Chromium-Browser",
+        ] {
+            assert!(is_chrome_class(Some(class)), "{class}");
+        }
+        for class in ["google-chrome-stable", "chromium-browser-dev", "chrome", ""] {
+            assert!(!is_chrome_class(Some(class)), "{class}");
+        }
+        assert!(!is_chrome_class(None));
     }
 }

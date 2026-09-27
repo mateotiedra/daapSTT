@@ -1,0 +1,44 @@
+#!/bin/sh
+# Start only per-user IME services. Never change the desktop-wide input method.
+for variable in DISPLAY WAYLAND_DISPLAY XAUTHORITY; do
+    if printenv "$variable" >/dev/null; then
+        systemctl --user import-environment "$variable"
+    fi
+done
+# Discover the existing bus through IBus itself; never replace another daemon.
+if ! /usr/bin/python3 -c 'import gi; gi.require_version("IBus", "1.0"); from gi.repository import IBus; IBus.init(); raise SystemExit(not IBus.Bus().is_connected())'; then
+    systemctl --user start daapstt-ibus.service || true
+fi
+systemctl --user start daapstt-ime.service || true
+if ! /usr/bin/python3 - <<'PY'
+import os
+import socket
+import stat
+import time
+
+runtime = os.environ.get("XDG_RUNTIME_DIR")
+if not runtime:
+    raise SystemExit(1)
+path = os.path.join(runtime, "daapstt", "ime.sock")
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise SystemExit(1)
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(0.2)
+            client.connect(path)
+        raise SystemExit(0)
+    except OSError:
+        time.sleep(0.1)
+raise SystemExit(1)
+PY
+then
+    warning='DaapSTT IME unavailable: Chrome opens normally; voice input requires IBus and a focused text field.'
+    printf '%s\n' "$warning" >&2
+    if command -v notify-send >/dev/null; then
+        notify-send 'Chrome voice input' "$warning" || true
+    fi
+fi
+GTK_IM_MODULE=ibus XMODIFIERS=@im=ibus exec /usr/bin/google-chrome-stable "$@"

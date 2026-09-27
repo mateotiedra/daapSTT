@@ -1,37 +1,65 @@
 use super::*;
 
 #[test]
-fn xwayland_discord_and_unknown_windows_use_safe_deferred_delivery() {
+fn chrome_routes_to_ime_before_the_xwayland_fallback() {
     let window = |class: &str, xwayland| crate::window::ActiveWindow {
         class: class.to_owned(),
         xwayland,
     };
 
+    for class in [
+        "Google-chrome",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+        "chromium",
+        "chromium-browser",
+    ] {
+        assert_eq!(
+            delivery_for_active_window(Some(&window(class, true))),
+            RealtimeDelivery::Ime,
+            "{class}"
+        );
+    }
     assert_eq!(
         delivery_for_active_window(Some(&window("discord", false))),
         RealtimeDelivery::Deferred
     );
     assert_eq!(
-        delivery_for_active_window(Some(&window("DiScOrD", true))),
+        delivery_for_active_window(Some(&window("google-chrome-stable", true))),
         RealtimeDelivery::Deferred
-    );
-    assert_eq!(
-        delivery_for_active_window(Some(&window("Google-chrome", true))),
-        RealtimeDelivery::Deferred
-    );
-    assert_eq!(
-        delivery_for_active_window(Some(&window("chromium", true))),
-        RealtimeDelivery::Deferred
-    );
-    assert_eq!(
-        delivery_for_active_window(Some(&window("Google-chrome", false))),
-        RealtimeDelivery::Live
     );
     assert_eq!(
         delivery_for_active_window(Some(&window("firefox", false))),
         RealtimeDelivery::Live
     );
     assert_eq!(delivery_for_active_window(None), RealtimeDelivery::Deferred);
+}
+
+#[test]
+fn ime_preedit_keeps_confirmed_prefix_and_replaces_only_the_tail() {
+    let mut text = LiveText::new();
+    text = text.partial("bonj").next;
+    assert_eq!(visible_ime_preedit(&text), "bonj");
+
+    text = text.partial("bonjour").next;
+    assert_eq!(visible_ime_preedit(&text), "bonjour");
+
+    text = text.commit("bonjour").next;
+    assert_eq!(visible_ime_preedit(&text), "bonjour");
+    assert_eq!(text.committed_text(), "bonjour");
+
+    text = text.partial("fran").next;
+    assert_eq!(visible_ime_preedit(&text), "bonjour fran");
+    text = text.commit("français 👋").next;
+    assert_eq!(visible_ime_preedit(&text), "bonjour français 👋");
+    assert_eq!(text.committed_text(), "bonjour français 👋");
+}
+
+#[test]
+fn chrome_final_text_rejects_only_standalone_banana_placeholders() {
+    assert!(contains_clipboard_placeholder("préfixe banana suffixe"));
+    assert!(contains_clipboard_placeholder("BANANA"));
+    assert!(!contains_clipboard_placeholder("bananas banana_split"));
 }
 
 #[test]

@@ -1,0 +1,10 @@
+[Unit]
+Description=IBus for Chrome voice input
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ibus-daemon --panel=disable --config=disable --emoji-extension=disable
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

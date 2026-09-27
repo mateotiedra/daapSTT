@@ -7,12 +7,13 @@
 #   make run          Run in debug mode (foreground)
 #   make clean        Remove build artifacts
 
-.PHONY: build install uninstall run clean check test
+.PHONY: build install install-ime uninstall run clean check test
 
 BIN_NAME := daapstt
 BIN_DIR := $(HOME)/.local/bin
 SERVICE_DIR := $(HOME)/.config/systemd/user
 CONFIG_DIR := $(HOME)/.config/voice-daemon
+IME_LIB_DIR := $(HOME)/.local/lib/daapstt
 
 CARGO := cargo
 
@@ -48,6 +49,15 @@ install: build
 	@echo ""
 	@echo "Check logs:"
 	@echo "  journalctl --user -u voice-daemon -f"
+
+install-ime:
+	install -d -m 700 $(IME_LIB_DIR)
+	install -m 755 contrib/ibus/engine.py $(IME_LIB_DIR)/ibus_engine.py
+	install -d $(BIN_DIR) $(SERVICE_DIR)
+	install -m 755 contrib/ibus/daapstt-chrome $(BIN_DIR)/daapstt-chrome
+	install -m 644 contrib/ibus/daapstt-ibus.service $(SERVICE_DIR)/daapstt-ibus.service
+	install -m 644 contrib/ibus/daapstt-ime.service $(SERVICE_DIR)/daapstt-ime.service
+	systemctl --user daemon-reload
 
 uninstall:
 	@echo "Uninstalling $(BIN_NAME)..."

@@ -9,7 +9,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::live_text::LiveText;
 use crate::{
     audio, config, deliver, hotkey, keyterms, notify, placeholder, realtime, transcribe_batch,
-    RecordingState,
+    transcribe_batch_cancellable, RecordingState,
 };
 
 use deferred::{
@@ -45,6 +45,9 @@ fn realtime_next_step(
 
 fn delivery_for_active_window(window: Option<&crate::window::ActiveWindow>) -> RealtimeDelivery {
     match window {
+        Some(window) if crate::window::is_chrome_class(Some(&window.class)) => {
+            RealtimeDelivery::Ime
+        }
         Some(window) if crate::window::is_discord_class(Some(&window.class)) || window.xwayland => {
             RealtimeDelivery::Deferred
         }
@@ -67,11 +70,29 @@ pub(crate) async fn handle_realtime_press(
         (RealtimeDelivery::Deferred, None) => {
             warn!("active window could not be determined; using safe deferred delivery")
         }
+        (RealtimeDelivery::Ime, _) => {
+            match crate::ime::ImeSession::begin().await {
+                Ok(session) => state.ime_session = Some(session),
+                Err(e) => {
+                    warn!("failed to begin Chrome IME session: {e}");
+                    let _ = notify::error(
+                        "Voice daemon",
+                        "Chrome voice input unavailable — check IBus and focus a text field",
+                    )
+                    .await;
+                    return;
+                }
+            }
+            info!("realtime recording started with Chrome IME delivery");
+        }
         (RealtimeDelivery::Live, _) => info!("realtime recording started"),
     }
-    if !crate::begin_recording(config, state, !delivery.is_deferred()).await {
+    if !crate::begin_recording(config, state, delivery == RealtimeDelivery::Live).await {
+        state.finish_ime(true).await;
         return;
     }
+
+    let mut ime_session = state.ime_session.take();
     let max_dur = Duration::from_secs(config.max_recording_secs);
     let (pcm_tx, pcm_rx) = mpsc::unbounded_channel();
     let recording_handle =
@@ -79,6 +100,8 @@ pub(crate) async fn handle_realtime_press(
             Ok(handle) => handle,
             Err(e) => {
                 warn!("failed to start recording: {e}");
+                state.ime_session = ime_session.take();
+                state.finish_ime(true).await;
                 state.cleanup_marker().await;
                 state.restore_recording_audio().await;
                 let _ = notify::error(
@@ -98,10 +121,26 @@ pub(crate) async fn handle_realtime_press(
         },
         Err(e) => {
             warn!("failed to load realtime keyterms: {e}");
-            if wait_for_release(max_dur, hotkey_rx, !delivery.is_deferred()).await {
-                finish_realtime_without_session(config, state, recording_handle, delivery).await;
+            let safe = wait_for_release_or_ime_cancel(
+                max_dur,
+                hotkey_rx,
+                !delivery.is_deferred(),
+                &mut ime_session,
+            )
+            .await;
+            state.ime_session = ime_session.take();
+            if safe {
+                finish_realtime_without_session(
+                    config,
+                    state,
+                    recording_handle,
+                    delivery,
+                    hotkey_rx,
+                )
+                .await;
             } else {
                 let _ = recording_handle.stop().await;
+                state.finish_ime(true).await;
                 state.restore_recording_audio().await;
             }
             return;
@@ -111,10 +150,26 @@ pub(crate) async fn handle_realtime_press(
         Ok(session) => session,
         Err(e) => {
             warn!("failed to start realtime session: {e}");
-            if wait_for_release(max_dur, hotkey_rx, !delivery.is_deferred()).await {
-                finish_realtime_without_session(config, state, recording_handle, delivery).await;
+            let safe = wait_for_release_or_ime_cancel(
+                max_dur,
+                hotkey_rx,
+                !delivery.is_deferred(),
+                &mut ime_session,
+            )
+            .await;
+            state.ime_session = ime_session.take();
+            if safe {
+                finish_realtime_without_session(
+                    config,
+                    state,
+                    recording_handle,
+                    delivery,
+                    hotkey_rx,
+                )
+                .await;
             } else {
                 let _ = recording_handle.stop().await;
+                state.finish_ime(true).await;
                 state.restore_recording_audio().await;
             }
             return;
@@ -127,50 +182,99 @@ pub(crate) async fn handle_realtime_press(
     let mut session_open = true;
     let mut release_started = false;
     let mut keyboard_safe = true;
+    let mut ime_cancelled = false;
+    let mut ime_transport_failed = false;
     let timer = tokio::time::sleep(max_dur);
     tokio::pin!(timer);
     loop {
-        tokio::select! {
+        enum CaptureEvent {
+            Hotkey(Option<hotkey::HotkeyEvent>),
+            Realtime(Option<realtime::RealtimeEvent>),
+            Timeout,
+            ImeCancelled,
+        }
+        let event = tokio::select! {
             biased;
-            hotkey = hotkey_rx.recv() => match hotkey {
-                Some(hotkey::HotkeyEvent::ReleaseStarted) => {
-                    release_started = true;
-                    break;
-                }
-                Some(hotkey::HotkeyEvent::ReleaseCompleted) => {
-                    warn!("ignoring stray hotkey release completion while recording")
-                }
-                Some(hotkey::HotkeyEvent::Press) => warn!("ignoring repeated hotkey press while recording"),
-                None => {
-                    warn!("hotkey channel closed; modifier state is unknown");
-                    keyboard_safe = false;
-                    break;
-                }
-            },
-            event = session.recv(), if session_open => match event {
-                Some(event) => process_realtime_event(
+            _ = async { ime_session.as_mut().expect("guarded IME session").cancelled().await }, if ime_session.is_some() => CaptureEvent::ImeCancelled,
+            hotkey = hotkey_rx.recv() => CaptureEvent::Hotkey(hotkey),
+            event = session.recv(), if session_open => CaptureEvent::Realtime(event),
+            _ = &mut timer => CaptureEvent::Timeout,
+        };
+        match event {
+            CaptureEvent::ImeCancelled => {
+                ime_cancelled = true;
+                break;
+            }
+            CaptureEvent::Hotkey(Some(hotkey::HotkeyEvent::ReleaseStarted)) => {
+                release_started = true;
+                break;
+            }
+            CaptureEvent::Hotkey(Some(hotkey::HotkeyEvent::ReleaseCompleted)) => {
+                warn!("ignoring stray hotkey release completion while recording")
+            }
+            CaptureEvent::Hotkey(Some(hotkey::HotkeyEvent::Press)) => {
+                warn!("ignoring repeated hotkey press while recording")
+            }
+            CaptureEvent::Hotkey(None) => {
+                warn!("hotkey channel closed; recording delivery is unsafe");
+                keyboard_safe = false;
+                break;
+            }
+            CaptureEvent::Realtime(Some(event)) => {
+                process_realtime_event(
                     event,
                     state,
+                    ime_session.as_mut(),
                     &mut live_text,
                     &mut failed,
                     &mut tail_safe,
+                    &mut ime_cancelled,
                     delivery,
-                ).await,
-                None => { session_open = false; if failed.is_none() { failed = Some(realtime::RealtimeError::TaskFailed); } }
-            },
-            _ = &mut timer => { info!("max recording duration ({}s) reached — auto-stopping", config.max_recording_secs); break; }
+                )
+                .await;
+                if ime_cancelled {
+                    break;
+                }
+                if delivery == RealtimeDelivery::Ime && !tail_safe {
+                    ime_transport_failed = true;
+                    break;
+                }
+            }
+            CaptureEvent::Realtime(None) => {
+                session_open = false;
+                if failed.is_none() {
+                    failed = Some(realtime::RealtimeError::TaskFailed);
+                }
+            }
+            CaptureEvent::Timeout => {
+                info!(
+                    "max recording duration ({}s) reached — auto-stopping",
+                    config.max_recording_secs
+                );
+                break;
+            }
         }
     }
+    if ime_cancelled || ime_transport_failed || !keyboard_safe {
+        let (_, ()) = tokio::join!(recording_handle.stop(), state.restore_recording_audio());
+        state.ime_session = ime_session.take();
+        state.finish_ime(true).await;
+        if ime_transport_failed {
+            let _ = notify::error(
+                "Voice daemon",
+                "Chrome voice input unavailable — dictation was not committed",
+            )
+            .await;
+        }
+        return;
+    }
+
 
     let audio_result = recording_handle.stop().await;
     state.restore_recording_audio().await;
-    if !keyboard_safe {
-        state.restore_recording_audio().await;
-        return;
-    }
+    state.ime_session = ime_session.take();
     if !wait_for_delivery_safety(delivery, release_started, hotkey_rx).await {
-        // The hotkey's modifier state is unknown, so never touch live text or
-        // the marker through wtype.
+        state.finish_ime(true).await;
         state.restore_recording_audio().await;
         return;
     }
@@ -178,7 +282,8 @@ pub(crate) async fn handle_realtime_press(
         Ok(audio) => audio,
         Err(e) => {
             warn!("audio capture error: {e}");
-            cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
+            cleanup_live_tail(state, &mut live_text, tail_safe, delivery).await;
+            state.finish_ime(true).await;
             state.cleanup_marker().await;
             state.restore_recording_audio().await;
             let _ = notify::error("Voice daemon", "Audio capture failed").await;
@@ -192,27 +297,81 @@ pub(crate) async fn handle_realtime_press(
     {
         failed = Some(realtime::RealtimeError::TaskFailed);
     }
+    let mut ime_session = state.ime_session.take();
     while session_open {
-        match session.recv().await {
-            // Partials are only a live preview. A late cumulative partial during
-            // finalization would be inserted and immediately removed by cleanup.
-            Some(event) if !process_during_finalization(&event) => {}
-            Some(event) => {
+        enum FinalEvent {
+            Realtime(Option<realtime::RealtimeEvent>),
+            Hotkey(Option<hotkey::HotkeyEvent>),
+            ImeCancelled,
+        }
+        let event = tokio::select! {
+            biased;
+            _ = async { ime_session.as_mut().expect("guarded IME session").cancelled().await }, if ime_session.is_some() => FinalEvent::ImeCancelled,
+            hotkey = hotkey_rx.recv() => FinalEvent::Hotkey(hotkey),
+            event = session.recv() => FinalEvent::Realtime(event),
+        };
+        match event {
+            FinalEvent::ImeCancelled => {
+                ime_cancelled = true;
+                break;
+            }
+            FinalEvent::Hotkey(None) => {
+                warn!("hotkey channel closed during realtime finalization");
+                ime_cancelled = true;
+                break;
+            }
+            FinalEvent::Hotkey(Some(hotkey::HotkeyEvent::ReleaseCompleted)) => {}
+            FinalEvent::Hotkey(Some(hotkey::HotkeyEvent::ReleaseStarted)) => {
+                warn!("ignoring repeated hotkey release start during finalization")
+            }
+            FinalEvent::Hotkey(Some(hotkey::HotkeyEvent::Press)) => {
+                warn!("ignoring repeated hotkey press during finalization")
+            }
+            FinalEvent::Realtime(Some(event)) if !process_during_finalization(&event) => {}
+            FinalEvent::Realtime(Some(event)) => {
                 process_realtime_event(
                     event,
                     state,
+                    ime_session.as_mut(),
                     &mut live_text,
                     &mut failed,
                     &mut tail_safe,
+                    &mut ime_cancelled,
                     delivery,
                 )
-                .await
+                .await;
+                if ime_cancelled {
+                    break;
+                }
+                if delivery == RealtimeDelivery::Ime && !tail_safe {
+                    ime_transport_failed = true;
+                    break;
+                }
             }
-            None => session_open = false,
+            FinalEvent::Realtime(None) => session_open = false,
         }
     }
+    state.ime_session = ime_session.take();
+    if ime_cancelled || ime_transport_failed {
+        state.finish_ime(true).await;
+        if ime_transport_failed {
+            let _ = notify::error(
+                "Voice daemon",
+                "Chrome voice input unavailable — dictation was not committed",
+            )
+            .await;
+        }
+        return;
+    }
     finish_realtime_result(
-        config, state, audio_data, live_text, failed, tail_safe, delivery,
+        config,
+        state,
+        audio_data,
+        live_text,
+        failed,
+        tail_safe,
+        delivery,
+        hotkey_rx,
     )
     .await;
 }
@@ -238,11 +397,28 @@ async fn wait_for_release(
     }
 }
 
+async fn wait_for_release_or_ime_cancel(
+    max_dur: Duration,
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
+    allow_timeout_completion: bool,
+    ime_session: &mut Option<crate::ime::ImeSession>,
+) -> bool {
+    if let Some(session) = ime_session.as_mut() {
+        tokio::select! {
+            safe = wait_for_release(max_dur, hotkey_rx, allow_timeout_completion) => safe,
+            _ = session.cancelled() => false,
+        }
+    } else {
+        wait_for_release(max_dur, hotkey_rx, allow_timeout_completion).await
+    }
+}
+
 async fn finish_realtime_without_session(
     config: &config::Config,
     state: &mut RecordingState,
     recording_handle: audio::RecordingHandle,
     delivery: RealtimeDelivery,
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
 ) {
     let audio_result = recording_handle.stop().await;
     state.restore_recording_audio().await;
@@ -256,11 +432,13 @@ async fn finish_realtime_without_session(
                 Some(realtime::RealtimeError::TaskFailed),
                 true,
                 delivery,
+                hotkey_rx,
             )
             .await
         }
         Err(e) => {
             warn!("audio capture error: {e}");
+            state.finish_ime(true).await;
             state.cleanup_marker().await;
             state.restore_recording_audio().await;
             let _ = notify::error("Voice daemon", "Audio capture failed").await;
@@ -271,9 +449,11 @@ async fn finish_realtime_without_session(
 async fn process_realtime_event(
     event: realtime::RealtimeEvent,
     state: &mut RecordingState,
+    ime_session: Option<&mut crate::ime::ImeSession>,
     live_text: &mut LiveText,
     failed: &mut Option<realtime::RealtimeError>,
     tail_safe: &mut bool,
+    ime_cancelled: &mut bool,
     delivery: RealtimeDelivery,
 ) {
     match event {
@@ -285,20 +465,83 @@ async fn process_realtime_event(
         realtime::RealtimeEvent::PartialTranscript(text) => {
             if failed.is_none() && !delivery.is_deferred() {
                 let text = crate::transcript::clean(&text);
-                apply_live_text(state, live_text, &text, false, failed, tail_safe).await;
+                if delivery == RealtimeDelivery::Ime {
+                    apply_ime_live_text(
+                        ime_session.expect("IME delivery requires a session"),
+                        live_text,
+                        &text,
+                        false,
+                        failed,
+                        tail_safe,
+                        ime_cancelled,
+                    )
+                    .await;
+                } else {
+                    apply_live_text(state, live_text, &text, false, failed, tail_safe).await;
+                }
             }
         }
         realtime::RealtimeEvent::CommittedTranscript(text) => {
             if failed.is_none() {
                 let text = crate::transcript::clean(&text);
-                if delivery.is_deferred() {
-                    accumulate_committed_text(live_text, &text);
-                } else {
-                    apply_live_text(state, live_text, &text, true, failed, tail_safe).await;
+                match delivery {
+                    RealtimeDelivery::Deferred => accumulate_committed_text(live_text, &text),
+                    RealtimeDelivery::Ime => {
+                        apply_ime_live_text(
+                            ime_session.expect("IME delivery requires a session"),
+                            live_text,
+                            &text,
+                            true,
+                            failed,
+                            tail_safe,
+                            ime_cancelled,
+                        )
+                        .await
+                    }
+                    RealtimeDelivery::Live => {
+                        apply_live_text(state, live_text, &text, true, failed, tail_safe).await
+                    }
                 }
             }
         }
     }
+}
+
+fn visible_ime_preedit(live_text: &LiveText) -> String {
+    format!("{}{}", live_text.committed_text(), live_text.tail())
+}
+
+fn ime_error_is_expected_cancellation(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("IME session was cancelled")
+        || message.contains("focus_changed")
+        || message.contains("user_input")
+        || message.contains("disabled")
+}
+
+async fn apply_ime_live_text(
+    session: &mut crate::ime::ImeSession,
+    live_text: &mut LiveText,
+    text: &str,
+    committed: bool,
+    failed: &mut Option<realtime::RealtimeError>,
+    tail_safe: &mut bool,
+    ime_cancelled: &mut bool,
+) {
+    let transition = if committed {
+        live_text.commit(text)
+    } else {
+        live_text.partial(text)
+    };
+    let preedit = visible_ime_preedit(&transition.next);
+    if let Err(e) = session.partial(&preedit).await {
+        warn!("failed to update Chrome IME preedit: {e}");
+        *ime_cancelled = ime_error_is_expected_cancellation(&e);
+        *failed = Some(realtime::RealtimeError::TaskFailed);
+        *tail_safe = false;
+        return;
+    }
+    *live_text = transition.next;
 }
 
 async fn apply_live_text(
@@ -399,6 +642,7 @@ fn clipboard_replacement_plan(
 }
 
 async fn cleanup_live_tail(
+    state: &mut RecordingState,
     live_text: &mut LiveText,
     tail_safe: bool,
     delivery: RealtimeDelivery,
@@ -410,6 +654,20 @@ async fn cleanup_live_tail(
         return false;
     }
     let transition = live_text.cleanup();
+    if delivery == RealtimeDelivery::Ime {
+        if transition.edit.backspaces == 0 && transition.edit.insert.is_empty() {
+            return true;
+        }
+        let Some(session) = state.ime_session.as_mut() else {
+            return false;
+        };
+        if let Err(e) = session.clear().await {
+            warn!("failed to clear Chrome IME preedit: {e}");
+            return false;
+        }
+        *live_text = transition.next;
+        return true;
+    }
     if transition.edit.backspaces == 0 && transition.edit.insert.is_empty() {
         return true;
     }
@@ -431,11 +689,25 @@ async fn finish_realtime_result(
     failed: Option<realtime::RealtimeError>,
     tail_safe: bool,
     delivery: RealtimeDelivery,
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
 ) {
     let usable_audio =
         audio_data.data.len() >= 800 && !audio::is_silence(audio_data.peak_amplitude);
+    if delivery == RealtimeDelivery::Ime {
+        finish_ime_result(
+            config,
+            state,
+            audio_data,
+            live_text,
+            failed,
+            tail_safe,
+            hotkey_rx,
+        )
+        .await;
+        return;
+    }
     if !usable_audio {
-        cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
+        cleanup_live_tail(state, &mut live_text, tail_safe, delivery).await;
         state.cleanup_marker().await;
         if audio::is_silence(audio_data.peak_amplitude) && audio_data.data.len() >= 800 {
             let _ = notify::error(
@@ -454,7 +726,7 @@ async fn finish_realtime_result(
         usable_audio,
     ) {
         RealtimeNextStep::FallbackBatch => {
-            if cleanup_live_tail(&mut live_text, tail_safe, delivery).await {
+            if cleanup_live_tail(state, &mut live_text, tail_safe, delivery).await {
                 transcribe_batch(config, state, audio_data).await;
             } else {
                 state.cleanup_marker().await;
@@ -467,7 +739,7 @@ async fn finish_realtime_result(
             }
         }
         RealtimeNextStep::NotifyFailure => {
-            cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
+            cleanup_live_tail(state, &mut live_text, tail_safe, delivery).await;
             if delivery.is_deferred() {
                 deliver_deferred_transcript(&live_text).await;
             }
@@ -480,7 +752,7 @@ async fn finish_realtime_result(
             state.restore_recording_audio().await;
         }
         RealtimeNextStep::Done => {
-            cleanup_live_tail(&mut live_text, tail_safe, delivery).await;
+            cleanup_live_tail(state, &mut live_text, tail_safe, delivery).await;
             if delivery.is_deferred() {
                 deliver_deferred_transcript(&live_text).await;
             }
@@ -488,6 +760,77 @@ async fn finish_realtime_result(
             state.restore_recording_audio().await;
         }
     }
+}
+
+fn contains_clipboard_placeholder(text: &str) -> bool {
+    placeholder::parse_banana_chunks(text)
+        .iter()
+        .any(|chunk| matches!(chunk, placeholder::TranscriptChunk::ClipboardPlaceholder))
+}
+
+async fn finish_ime_result(
+    config: &config::Config,
+    state: &mut RecordingState,
+    audio_data: audio::AudioRecording,
+    mut live_text: LiveText,
+    failed: Option<realtime::RealtimeError>,
+    tail_safe: bool,
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
+) {
+    let usable_audio =
+        audio_data.data.len() >= 800 && !audio::is_silence(audio_data.peak_amplitude);
+    if !usable_audio {
+        state.finish_ime(true).await;
+        if audio::is_silence(audio_data.peak_amplitude) && audio_data.data.len() >= 800 {
+            let _ = notify::error(
+                "Voice daemon",
+                "Microphone appears silent — check your input volume/source in PipeWire",
+            )
+            .await;
+        }
+        state.restore_recording_audio().await;
+        return;
+    }
+
+    if failed.is_some() && !live_text.committed_any() && tail_safe {
+        if cleanup_live_tail(state, &mut live_text, tail_safe, RealtimeDelivery::Ime).await {
+            transcribe_batch_cancellable(config, state, audio_data, hotkey_rx).await;
+        } else {
+            state.finish_ime(true).await;
+            let _ = notify::error(
+                "Voice daemon",
+                realtime_error_notification(failed.as_ref().expect("failure required")),
+            )
+            .await;
+            state.restore_recording_audio().await;
+        }
+        return;
+    }
+
+    let confirmed = live_text.committed_text().to_owned();
+    let unsupported_placeholder = contains_clipboard_placeholder(&confirmed);
+    if !tail_safe || unsupported_placeholder {
+        state.finish_ime(true).await;
+    } else if confirmed.is_empty() {
+        state.finish_ime(false).await;
+    } else if !state.commit_ime(&confirmed).await {
+        let _ = notify::error(
+            "Voice daemon",
+            "Chrome voice input unavailable — dictation was not committed",
+        )
+        .await;
+    }
+
+    if unsupported_placeholder {
+        let _ = notify::error(
+            "Voice daemon",
+            "Clipboard placeholder is unsupported in Chrome voice input",
+        )
+        .await;
+    } else if let Some(error) = failed.as_ref() {
+        let _ = notify::error("Voice daemon", realtime_error_notification(error)).await;
+    }
+    state.restore_recording_audio().await;
 }
 
 fn realtime_error_notification(error: &realtime::RealtimeError) -> &'static str {

@@ -5,6 +5,7 @@ mod clipboard;
 mod config;
 mod deliver;
 mod hotkey;
+mod ime;
 mod keyterms;
 mod live_text;
 mod media;
@@ -29,6 +30,7 @@ pub(crate) struct RecordingState {
     marker_char: String,
     output_mute_state: media::OutputMuteState,
     mic_mute_state: mic::MicMuteState,
+    pub(crate) ime_session: Option<ime::ImeSession>,
 }
 
 impl RecordingState {
@@ -37,6 +39,7 @@ impl RecordingState {
             marker_active: false,
             marker_char,
             output_mute_state: media::OutputMuteState::new(),
+            ime_session: None,
             mic_mute_state: mic::MicMuteState::new(),
         }
     }
@@ -58,6 +61,39 @@ impl RecordingState {
     pub(crate) async fn restore_recording_audio(&mut self) {
         media::restore_muted_outputs(&mut self.output_mute_state).await;
         self.mic_mute_state.restore().await;
+    }
+
+    pub(crate) async fn finish_ime(&mut self, cancel: bool) {
+        let Some(mut session) = self.ime_session.take() else {
+            return;
+        };
+        let result = if cancel {
+            session.cancel().await
+        } else {
+            session.finish().await
+        };
+        if let Err(e) = result {
+            warn!("failed to close IME session: {e}");
+        }
+    }
+
+    pub(crate) async fn commit_ime(&mut self, text: &str) -> bool {
+        let Some(mut session) = self.ime_session.take() else {
+            return false;
+        };
+        match session.commit(text).await {
+            Ok(()) => {
+                if let Err(e) = session.finish().await {
+                    warn!("failed to finish acknowledged IME commit: {e}");
+                }
+                true
+            }
+            Err(e) => {
+                warn!("failed to commit IME transcription: {e}");
+                let _ = session.cancel().await;
+                false
+            }
+        }
     }
 }
 
@@ -143,6 +179,7 @@ async fn main() -> Result<()> {
             },
             _ = shutdown_notify.notified() => {
                 info!("shutting down gracefully...");
+                state.finish_ime(true).await;
                 state.cleanup_marker().await;
                 state.restore_recording_audio().await;
                 break;
@@ -334,11 +371,30 @@ pub(crate) async fn transcribe_batch(
     state: &mut RecordingState,
     audio_data: audio::AudioRecording,
 ) {
+    transcribe_batch_inner(config, state, audio_data, None).await;
+}
+
+pub(crate) async fn transcribe_batch_cancellable(
+    config: &config::Config,
+    state: &mut RecordingState,
+    audio_data: audio::AudioRecording,
+    hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
+) {
+    transcribe_batch_inner(config, state, audio_data, Some(hotkey_rx)).await;
+}
+
+async fn transcribe_batch_inner(
+    config: &config::Config,
+    state: &mut RecordingState,
+    audio_data: audio::AudioRecording,
+    hotkey_rx: Option<&mut mpsc::Receiver<hotkey::HotkeyEvent>>,
+) {
     if audio_data.data.len() < 800 {
         info!(
             "recording too short ({:.2}s) — likely silence, discarding",
             audio_data.duration_secs
         );
+        state.finish_ime(true).await;
         state.cleanup_marker().await;
         state.restore_recording_audio().await;
         return;
@@ -348,6 +404,7 @@ pub(crate) async fn transcribe_batch(
             "recording silent (peak amp {}) — skipping transcription",
             audio_data.peak_amplitude
         );
+        state.finish_ime(true).await;
         state.cleanup_marker().await;
         state.restore_recording_audio().await;
         let _ = notify::error(
@@ -355,6 +412,10 @@ pub(crate) async fn transcribe_batch(
             "Microphone appears silent — check your input volume/source in PipeWire",
         )
         .await;
+        return;
+    }
+    if state.ime_session.is_some() {
+        transcribe_ime_batch(config, state, audio_data, hotkey_rx).await;
         return;
     }
     match transcribe::transcribe(config, &audio_data.data).await {
@@ -387,6 +448,89 @@ pub(crate) async fn transcribe_batch(
             state.restore_recording_audio().await;
         }
     }
+}
+
+async fn transcribe_ime_batch(
+    config: &config::Config,
+    state: &mut RecordingState,
+    audio_data: audio::AudioRecording,
+    mut hotkey_rx: Option<&mut mpsc::Receiver<hotkey::HotkeyEvent>>,
+) {
+    let mut session = state
+        .ime_session
+        .take()
+        .expect("IME batch delivery requires a session");
+    let transcription = transcribe::transcribe(config, &audio_data.data);
+    tokio::pin!(transcription);
+    let transcription = loop {
+        enum BatchEvent {
+            Transcribed(anyhow::Result<String>),
+            ImeCancelled,
+            Hotkey(Option<hotkey::HotkeyEvent>),
+        }
+        let event = tokio::select! {
+            result = &mut transcription => BatchEvent::Transcribed(result),
+            _ = session.cancelled() => BatchEvent::ImeCancelled,
+            hotkey = async {
+                hotkey_rx
+                    .as_mut()
+                    .expect("guarded hotkey receiver")
+                    .recv()
+                    .await
+            }, if hotkey_rx.is_some() => BatchEvent::Hotkey(hotkey),
+        };
+        match event {
+            BatchEvent::Transcribed(result) => break Some(result),
+            BatchEvent::ImeCancelled | BatchEvent::Hotkey(None) => break None,
+            BatchEvent::Hotkey(Some(hotkey::HotkeyEvent::ReleaseCompleted)) => {}
+            BatchEvent::Hotkey(Some(hotkey::HotkeyEvent::ReleaseStarted)) => {}
+            BatchEvent::Hotkey(Some(hotkey::HotkeyEvent::Press)) => break None,
+        }
+    };
+    let Some(transcription) = transcription else {
+        let _ = session.cancel().await;
+        state.restore_recording_audio().await;
+        return;
+    };
+    state.ime_session = Some(session);
+
+    match transcription {
+        Ok(text) if text.trim().is_empty() => {
+            state.finish_ime(false).await;
+        }
+        Ok(text) => {
+            let has_placeholder = placeholder::parse_banana_chunks(&text)
+                .iter()
+                .any(|chunk| {
+                    matches!(chunk, placeholder::TranscriptChunk::ClipboardPlaceholder)
+                });
+            if has_placeholder {
+                state.finish_ime(true).await;
+                let _ = notify::error(
+                    "Voice daemon",
+                    "Clipboard placeholder is unsupported in Chrome voice input",
+                )
+                .await;
+            } else {
+                info!("transcription completed");
+                if !state.commit_ime(&text).await {
+                    let _ = notify::error(
+                        "Voice daemon",
+                        "Chrome voice input unavailable — dictation was not committed",
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(e) => {
+            let err_msg = e.to_string();
+            warn!("transcription failed: {err_msg}");
+            state.finish_ime(true).await;
+            let _ = notify::error("Voice daemon", batch_error_notification(&err_msg)).await;
+        }
+    }
+    state.cleanup_marker().await;
+    state.restore_recording_audio().await;
 }
 
 fn batch_error_notification(error: &str) -> &'static str {
