@@ -43,9 +43,11 @@ fn realtime_next_step(
     }
 }
 
-fn delivery_for_active_class(class: Option<&str>) -> RealtimeDelivery {
-    match class {
-        Some(class) if crate::window::is_discord_class(Some(class)) => RealtimeDelivery::Deferred,
+fn delivery_for_active_window(window: Option<&crate::window::ActiveWindow>) -> RealtimeDelivery {
+    match window {
+        Some(window) if crate::window::is_discord_class(Some(&window.class)) || window.xwayland => {
+            RealtimeDelivery::Deferred
+        }
         Some(_) => RealtimeDelivery::Live,
         None => RealtimeDelivery::Deferred,
     }
@@ -56,11 +58,11 @@ pub(crate) async fn handle_realtime_press(
     state: &mut RecordingState,
     hotkey_rx: &mut mpsc::Receiver<hotkey::HotkeyEvent>,
 ) {
-    let active_class = crate::window::active_class().await;
-    let delivery = delivery_for_active_class(active_class.as_deref());
-    match (delivery, active_class.as_deref()) {
+    let active_window = crate::window::active_window().await;
+    let delivery = delivery_for_active_window(active_window.as_ref());
+    match (delivery, active_window.as_ref()) {
         (RealtimeDelivery::Deferred, Some(_)) => {
-            info!("realtime recording started with deferred Discord delivery")
+            info!("realtime recording started with modifier-safe deferred delivery")
         }
         (RealtimeDelivery::Deferred, None) => {
             warn!("active window could not be determined; using safe deferred delivery")

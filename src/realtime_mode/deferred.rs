@@ -1,4 +1,4 @@
-//! Modifier-safe deferred delivery for Discord realtime dictation.
+//! Modifier-safe deferred delivery for realtime dictation.
 
 use log::warn;
 use tokio::sync::mpsc;
@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use crate::live_text::LiveText;
 use crate::{deliver, hotkey, placeholder};
 
-const DISCORD_KEY_DELAY_MS: u64 = 3;
+const DEFERRED_KEY_DELAY_MS: u64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RealtimeDelivery {
@@ -51,12 +51,12 @@ pub(super) async fn deliver_transcript(live_text: &LiveText) {
         .iter()
         .any(|chunk| matches!(chunk, placeholder::TranscriptChunk::ClipboardPlaceholder))
     {
-        deliver::deliver_chunks_paced(&chunks, DISCORD_KEY_DELAY_MS).await
+        deliver::deliver_chunks_paced(&chunks, DEFERRED_KEY_DELAY_MS).await
     } else {
-        deliver::type_text_paced(text, DISCORD_KEY_DELAY_MS).await
+        deliver::type_text_paced(text, DEFERRED_KEY_DELAY_MS).await
     };
     if let Err(e) = result {
-        warn!("failed to deliver deferred Discord transcript: {e}");
+        warn!("failed to deliver deferred realtime transcript: {e}");
     }
 }
 

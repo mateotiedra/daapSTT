@@ -71,7 +71,7 @@ The daemon also mutes other apps' currently active microphone capture streams wh
 
 Speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. Text is wrapped in double quotes, while images get one space before and after. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. In Realtime mode, paste happens when recognition becomes a stable committed segment, before the hotkey is released. Batch mode necessarily waits for the provider transcription result, but pastes immediately once `banana` is recognized.
 
-Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. The native Discord client is handled specially: no marker or partial text is injected while Alt+Space is held, and the stable transcript is delivered once after Alt is fully released. This avoids Discord interpreting synthetic edits as modifier shortcuts.
+Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. Native Wayland windows receive live edits through `wtype`. XWayland windows and the native Discord client are handled conservatively: no marker or partial text is injected while Alt+Space is held, and the stable transcript is delivered once after Alt is fully released. This avoids modifier shortcuts and preserves Unicode text.
 
 ```bash
 daapstt realtime on      # Enable realtime and restart the user service
@@ -149,7 +149,7 @@ keyd temporarily removes Alt while it emits the internal `F24` event. If Space i
 ## Troubleshooting
 
 - **Alt+Space does not start recording:** Confirm keyd is running with `systemctl status keyd`, then verify the existing `/etc/keyd/default.conf` contains the `[alt]` section and `space = f24` mapping shown above. Restart keyd after changes.
-- **Live text is affected by Alt shortcuts:** Ensure the mapping is in `/etc/keyd/default.conf`, not a separate wildcard configuration. The daemon observes both `F24` and Alt transitions from keyd's virtual keyboard so it can defer release-time `wtype` edits until Alt is safe.
+- **Live text is affected by Alt shortcuts:** Ensure the mapping is in `/etc/keyd/default.conf`, not a separate wildcard configuration. Native Wayland targets receive live edits. XWayland targets use safe deferred delivery because X11 modifier clearing cannot reliably preserve arbitrary Unicode text.
 
 ## Development
 

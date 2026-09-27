@@ -1,20 +1,37 @@
 use super::*;
 
 #[test]
-fn discord_and_unknown_windows_use_safe_deferred_delivery() {
+fn xwayland_discord_and_unknown_windows_use_safe_deferred_delivery() {
+    let window = |class: &str, xwayland| crate::window::ActiveWindow {
+        class: class.to_owned(),
+        xwayland,
+    };
+
     assert_eq!(
-        delivery_for_active_class(Some("discord")),
+        delivery_for_active_window(Some(&window("discord", false))),
         RealtimeDelivery::Deferred
     );
     assert_eq!(
-        delivery_for_active_class(Some("DiScOrD")),
+        delivery_for_active_window(Some(&window("DiScOrD", true))),
         RealtimeDelivery::Deferred
     );
-    assert_eq!(delivery_for_active_class(None), RealtimeDelivery::Deferred);
     assert_eq!(
-        delivery_for_active_class(Some("firefox")),
+        delivery_for_active_window(Some(&window("Google-chrome", true))),
+        RealtimeDelivery::Deferred
+    );
+    assert_eq!(
+        delivery_for_active_window(Some(&window("chromium", true))),
+        RealtimeDelivery::Deferred
+    );
+    assert_eq!(
+        delivery_for_active_window(Some(&window("Google-chrome", false))),
         RealtimeDelivery::Live
     );
+    assert_eq!(
+        delivery_for_active_window(Some(&window("firefox", false))),
+        RealtimeDelivery::Live
+    );
+    assert_eq!(delivery_for_active_window(None), RealtimeDelivery::Deferred);
 }
 
 #[test]

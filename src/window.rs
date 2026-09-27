@@ -3,13 +3,22 @@
 use log::debug;
 use tokio::process::Command;
 
-/// Extracts the active window class from `hyprctl -j activewindow` output.
-fn class_from_hyprctl(output: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(output)
-        .ok()?
-        .get("class")?
-        .as_str()
-        .map(str::to_owned)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveWindow {
+    pub class: String,
+    pub xwayland: bool,
+}
+
+/// Extracts the active window metadata from `hyprctl -j activewindow` output.
+fn window_from_hyprctl(output: &str) -> Option<ActiveWindow> {
+    let window = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    Some(ActiveWindow {
+        class: window.get("class")?.as_str()?.to_owned(),
+        xwayland: window
+            .get("xwayland")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 /// Selects the Hyprland instance serving this process's Wayland display.
@@ -51,25 +60,30 @@ async fn hyprctl_json(args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-/// Returns the active Hyprland window class when it can be determined.
-pub async fn active_class() -> Option<String> {
-    if let Some(class) = hyprctl_json(&["-j", "activewindow"])
+/// Returns the active Hyprland window metadata when it can be determined.
+pub async fn active_window() -> Option<ActiveWindow> {
+    if let Some(window) = hyprctl_json(&["-j", "activewindow"])
         .await
         .as_deref()
-        .and_then(class_from_hyprctl)
+        .and_then(window_from_hyprctl)
     {
-        return Some(class);
+        return Some(window);
     }
 
     // A systemd user service may not inherit HYPRLAND_INSTANCE_SIGNATURE even
     // though its WAYLAND_DISPLAY is valid. Resolve the instance explicitly so
-    // Discord detection keeps working after login and compositor restarts.
+    // target-specific delivery keeps working after login and compositor restarts.
     debug!("resolving Hyprland instance without an inherited signature");
     let instances = hyprctl_json(&["-j", "instances"]).await?;
     let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
     let instance = instance_from_hyprctl(&instances, wayland_display.as_deref())?;
     let active_window = hyprctl_json(&["-j", "-i", &instance, "activewindow"]).await?;
-    class_from_hyprctl(&active_window)
+    window_from_hyprctl(&active_window)
+}
+
+/// Returns the active Hyprland window class when it can be determined.
+pub async fn active_class() -> Option<String> {
+    active_window().await.map(|window| window.class)
 }
 
 /// Whether a window class identifies the native Discord client.
@@ -82,13 +96,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_valid_active_window_classes() {
+    fn extracts_valid_active_window_metadata() {
         assert_eq!(
-            class_from_hyprctl(r#"{"class":"discord","title":"channel"}"#),
-            Some("discord".to_owned())
+            window_from_hyprctl(r#"{"class":"Google-chrome","title":"field","xwayland":true}"#),
+            Some(ActiveWindow {
+                class: "Google-chrome".to_owned(),
+                xwayland: true,
+            })
         );
-        assert_eq!(class_from_hyprctl("not json"), None);
-        assert_eq!(class_from_hyprctl(r#"{"title":"missing class"}"#), None);
+        assert_eq!(window_from_hyprctl("not json"), None);
+        assert_eq!(window_from_hyprctl(r#"{"title":"missing class"}"#), None);
+        assert_eq!(
+            window_from_hyprctl(r#"{"class":"firefox"}"#),
+            Some(ActiveWindow {
+                class: "firefox".to_owned(),
+                xwayland: false,
+            })
+        );
     }
 
     #[test]
