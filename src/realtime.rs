@@ -28,6 +28,9 @@ use url::Url;
 pub const MAX_KEYTERMS: usize = 50;
 /// The maximum time spent waiting for the server after a final commit.
 pub const FINALIZE_TIMEOUT: Duration = Duration::from_secs(3);
+// Stay below the provider's ~36-second automatic commit even in manual mode.
+// Only one explicit commit may be awaiting acknowledgement at a time.
+const MANUAL_SEGMENT_BYTES: usize = 20 * 16_000 * 2;
 
 /// Settings used to establish one realtime session.
 pub struct RealtimeConfig {
@@ -37,6 +40,8 @@ pub struct RealtimeConfig {
     pub api_key: String,
     /// Optional vocabulary hints. At most the first 50 are sent.
     pub keyterms: Vec<String>,
+    /// Explicit, acknowledged segments for native IME finalization.
+    pub manual_commits: bool,
 }
 
 /// A caller-visible event from a realtime session.
@@ -113,7 +118,8 @@ impl RealtimeSession {
         config: RealtimeConfig,
         audio: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> Result<Self, RealtimeError> {
-        let endpoint = build_realtime_url(&config.endpoint, &config.keyterms)?;
+        let endpoint =
+            build_realtime_url(&config.endpoint, &config.keyterms, config.manual_commits)?;
         if config.api_key.trim().is_empty() {
             return Err(RealtimeError::InvalidApiKey);
         }
@@ -126,6 +132,7 @@ impl RealtimeSession {
             audio,
             control_rx,
             events_tx,
+            config.manual_commits,
         ));
 
         Ok(Self {
@@ -160,7 +167,11 @@ impl RealtimeSession {
 }
 
 /// Build the endpoint URL without putting credentials in it.
-pub fn build_realtime_url(endpoint: &str, keyterms: &[String]) -> Result<Url, RealtimeError> {
+pub fn build_realtime_url(
+    endpoint: &str,
+    keyterms: &[String],
+    manual_commits: bool,
+) -> Result<Url, RealtimeError> {
     let mut url = Url::parse(endpoint).map_err(|_| RealtimeError::InvalidEndpoint)?;
     if !matches!(url.scheme(), "ws" | "wss") || url.host_str().is_none() {
         return Err(RealtimeError::InvalidEndpoint);
@@ -169,7 +180,7 @@ pub fn build_realtime_url(endpoint: &str, keyterms: &[String]) -> Result<Url, Re
     let mut query = url.query_pairs_mut();
     query.append_pair("model_id", "scribe_v2_realtime");
     query.append_pair("audio_format", "pcm_16000");
-    query.append_pair("commit_strategy", "vad");
+    query.append_pair("commit_strategy", if manual_commits { "manual" } else { "vad" });
     query.append_pair("no_verbatim", "true");
     for keyterm in keyterms.iter().take(MAX_KEYTERMS) {
         query.append_pair("keyterms", keyterm);
@@ -284,6 +295,7 @@ async fn run_session(
     mut audio: mpsc::UnboundedReceiver<Vec<u8>>,
     mut controls: mpsc::UnboundedReceiver<RealtimeControl>,
     events: mpsc::UnboundedSender<RealtimeEvent>,
+    manual_commits: bool,
 ) {
     let mut request = match endpoint.as_str().into_client_request() {
         Ok(request) => request,
@@ -303,12 +315,33 @@ async fn run_session(
     };
 
     let mut audio_closed = false;
+    let mut segment_bytes = 0;
     loop {
         tokio::select! {
             control = controls.recv() => {
                 match control {
                     Some(RealtimeControl::Finalize) | None => {
-                        finalize_socket(&mut socket, &events).await;
+                        // Stop the producer, but preserve all audio already queued
+                        // before the release; Finalize can win the select race.
+                        audio.close();
+                        while let Some(pcm) = audio.recv().await {
+                            if !send_audio(&mut socket, &events, &pcm, manual_commits, &mut segment_bytes).await {
+                                return;
+                            }
+                        }
+                        if manual_commits {
+                            if segment_bytes > 0 {
+                                if let Err(error) = send_chunk(&mut socket, &[], true).await {
+                                    return emit_error(&events, error);
+                                }
+                                if !wait_for_manual_commit(&mut socket, &events).await {
+                                    return;
+                                }
+                            }
+                            emit_completed(&events);
+                        } else {
+                            finalize_socket(&mut socket, &events).await;
+                        }
                         return;
                     }
                 }
@@ -316,13 +349,8 @@ async fn run_session(
             frame = audio.recv(), if !audio_closed => {
                 match frame {
                     Some(pcm) => {
-                        let payload = match serialize_audio_chunk(&pcm, false) {
-                            Ok(payload) => payload,
-                            Err(error) => return emit_error(&events, error),
-                        };
-                        match timeout(FINALIZE_TIMEOUT, socket.send(Message::Text(payload.into()))).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) | Err(_) => return emit_error(&events, RealtimeError::WebSocketFailed),
+                        if !send_audio(&mut socket, &events, &pcm, manual_commits, &mut segment_bytes).await {
+                            return;
                         }
                     }
                     None => {
@@ -336,6 +364,81 @@ async fn run_session(
                 if handle_socket_message(incoming, &events) == SocketOutcome::Ended {
                     return;
                 }
+            }
+        }
+    }
+}
+
+async fn send_chunk<S>(socket: &mut S, pcm: &[u8], commit: bool) -> Result<(), RealtimeError>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let payload = serialize_audio_chunk(pcm, commit)?;
+    match timeout(FINALIZE_TIMEOUT, socket.send(Message::Text(payload.into()))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(RealtimeError::WebSocketFailed),
+    }
+}
+
+async fn send_audio<S>(
+    socket: &mut S,
+    events: &mpsc::UnboundedSender<RealtimeEvent>,
+    mut pcm: &[u8],
+    manual_commits: bool,
+    segment_bytes: &mut usize,
+) -> bool
+where
+    S: futures_util::Sink<Message>
+        + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    if !manual_commits {
+        return match send_chunk(socket, pcm, false).await {
+            Ok(()) => true,
+            Err(error) => {
+                emit_error(events, error);
+                false
+            }
+        };
+    }
+    while !pcm.is_empty() {
+        let count = pcm.len().min(MANUAL_SEGMENT_BYTES - *segment_bytes);
+        *segment_bytes += count;
+        let commit = *segment_bytes == MANUAL_SEGMENT_BYTES;
+        if let Err(error) = send_chunk(socket, &pcm[..count], commit).await {
+            emit_error(events, error);
+            return false;
+        }
+        pcm = &pcm[count..];
+        if commit {
+            if !wait_for_manual_commit(socket, events).await {
+                return false;
+            }
+            *segment_bytes = 0;
+        }
+    }
+    true
+}
+
+async fn wait_for_manual_commit<S>(
+    socket: &mut S,
+    events: &mpsc::UnboundedSender<RealtimeEvent>,
+) -> bool
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let deadline = Instant::now() + FINALIZE_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Ok(message) => match handle_socket_message(message, events) {
+                SocketOutcome::Committed => return true,
+                SocketOutcome::Continue => {}
+                SocketOutcome::Ended => return false,
+            },
+            Err(_) => {
+                emit_error(events, RealtimeError::WebSocketFailed);
+                return false;
             }
         }
     }
@@ -411,12 +514,11 @@ fn handle_socket_message(
         }
         Ok(IncomingMessage::Other) => SocketOutcome::Continue,
         Ok(IncomingMessage::CommittedTranscript(text)) => {
-            if text.trim().is_empty() {
-                SocketOutcome::Continue
-            } else {
+            if !text.trim().is_empty() {
                 let _ = events.send(RealtimeEvent::CommittedTranscript(text));
-                SocketOutcome::Committed
             }
+            // Empty final text still acknowledges an explicit manual commit.
+            SocketOutcome::Committed
         }
         Ok(IncomingMessage::ProviderError { code, message }) => {
             emit_error(events, RealtimeError::Provider { code, message });

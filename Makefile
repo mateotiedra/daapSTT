@@ -54,7 +54,7 @@ install-ime:
 	install -d -m 700 $(IME_LIB_DIR)
 	install -m 755 contrib/ibus/engine.py $(IME_LIB_DIR)/ibus_engine.py
 	install -d $(BIN_DIR) $(SERVICE_DIR)
-	install -m 755 contrib/ibus/daapstt-chrome $(BIN_DIR)/daapstt-chrome
+	install -m 755 contrib/ibus/daapstt-ime-run $(BIN_DIR)/daapstt-ime-run
 	install -m 644 contrib/ibus/daapstt-ibus.service $(SERVICE_DIR)/daapstt-ibus.service
 	install -m 644 contrib/ibus/daapstt-ime.service $(SERVICE_DIR)/daapstt-ime.service
 	systemctl --user daemon-reload

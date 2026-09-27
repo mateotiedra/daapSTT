@@ -508,7 +508,7 @@ async fn transcribe_ime_batch(
                 state.finish_ime(true).await;
                 let _ = notify::error(
                     "Voice daemon",
-                    "Clipboard placeholder is unsupported in Chrome voice input",
+                    "Clipboard placeholder is unsupported in native voice input",
                 )
                 .await;
             } else {
@@ -516,7 +516,7 @@ async fn transcribe_ime_batch(
                 if !state.commit_ime(&text).await {
                     let _ = notify::error(
                         "Voice daemon",
-                        "Chrome voice input unavailable — dictation was not committed",
+                        "Native voice input unavailable — dictation was not committed",
                     )
                     .await;
                 }

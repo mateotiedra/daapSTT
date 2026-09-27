@@ -35,10 +35,10 @@ while time.monotonic() < deadline:
 raise SystemExit(1)
 PY
 then
-    warning='DaapSTT IME unavailable: Chrome opens normally; voice input requires IBus and a focused text field.'
+    warning='DaapSTT IME unavailable: the app opens normally; voice input requires IBus and a focused text field.'
     printf '%s\n' "$warning" >&2
     if command -v notify-send >/dev/null; then
-        notify-send 'Chrome voice input' "$warning" || true
+        notify-send 'Native voice input' "$warning" || true
     fi
 fi
-GTK_IM_MODULE=ibus XMODIFIERS=@im=ibus exec /usr/bin/google-chrome-stable "$@"
+GTK_IM_MODULE=ibus XMODIFIERS=@im=ibus exec "$@"

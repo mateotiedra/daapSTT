@@ -440,6 +440,7 @@ class Bridge:
         self.previous = pending["previous"]
         request = pending["request"]
         self.starting = None
+        engine.preedit("§")
         self.reply(request, session=self.session)
         return False
 

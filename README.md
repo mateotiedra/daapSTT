@@ -8,10 +8,10 @@ Uses [ElevenLabs Scribe v2](https://elevenlabs.io/docs/speech-to-text) for trans
 
 ```
 Batch: Alt+Space → § marker → speak → release → final text
-Chrome realtime: Alt+Space → speak → native preedit → release → one final commit
+Chrome/Discord realtime: Alt+Space → § preedit → live words → release → one final commit
 ```
 
-Chrome realtime intentionally has no `§` marker: its first visible feedback is the recognized preedit. Other realtime targets follow their delivery policy described below.
+Native IBus delivery shows `§` immediately, then replaces it with recognized words. Other realtime targets follow their delivery policy described below.
 
 ## Prerequisites
 
@@ -70,9 +70,9 @@ While the hotkey is held, the daemon uses PipeWire's PulseAudio compatibility la
 
 The daemon also mutes other apps' currently active microphone capture streams while the hotkey is held. This prevents Discord, browsers, and call apps from receiving your dictation while leaving the physical microphone available to daapSTT. Streams that capture system/monitor audio are ignored, streams that were already muted stay muted, and streams muted by daapSTT are restored as soon as recording stops. This does not toggle the mute control inside Discord or other apps.
 
-Outside Chrome realtime, speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. Text is wrapped in double quotes, while images get one space before and after. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. Live keyboard delivery pastes when recognition becomes a stable committed segment. Deferred and Batch delivery wait until their final delivery phase.
+Outside native IBus realtime, speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. Text is wrapped in double quotes, while images get one space before and after. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. Live keyboard delivery pastes when recognition becomes a stable committed segment. Deferred and Batch delivery wait until their final delivery phase.
 
-Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. Native Wayland windows receive live edits through `wtype`. Chrome/Chromium use the opt-in native IBus transport below, including under XWayland. Other XWayland windows and Discord retain deferred delivery: no marker or partial text while Alt+Space is held, then the stable transcript after Alt is released.
+Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. Native Wayland windows receive live edits through `wtype`. Chrome/Chromium and XWayland Discord use the opt-in native IBus transport below. Other XWayland windows and native Wayland Discord retain deferred delivery: no marker or partial text while Alt+Space is held, then the stable transcript after Alt is released.
 
 ```bash
 daapstt realtime on      # Enable realtime and restart the user service
@@ -82,11 +82,11 @@ daapstt realtime status  # Print Batch or Realtime
 
 Both Batch and Realtime transcripts remove boundary ASCII/smart double quotes and terminal ellipses. Internal punctuation and normal terminal periods remain unchanged.
 
-For live keyboard delivery outside Chrome, the current partial transcript is mutable: revisions replace only its changed suffix, while committed segments become immutable. Keep the cursor and window focus where dictation started until releasing the hotkey; moving either during keyboard-based dictation can revise text in the wrong location.
+For live keyboard delivery outside native IBus targets, the current partial transcript is mutable: revisions replace only its changed suffix, while committed segments become immutable. Keep the cursor and window focus where dictation started until releasing the hotkey; moving either during keyboard-based dictation can revise text in the wrong location.
 
 For keyboard-based realtime delivery, if recognition fails before any committed text appears, the provisional partial is removed and the buffered recording falls back to batch transcription after release. If it fails after a commit, the mutable tail is removed, committed text is kept, and the recording is not batch-transcribed again, avoiding duplicate output. Explicit Batch mode behavior is unchanged.
 
-### Chrome native voice input
+### Chrome and Discord native voice input
 
 Install the optional bridge separately from the daemon:
 
@@ -95,17 +95,20 @@ sudo apt-get install ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 python3-gi
 make install-ime
 ```
 
-Back up your user Chrome desktop launcher, then replace **only the executable** of each `Exec=` line with the absolute path `$HOME/.local/bin/daapstt-chrome` (expand `$HOME` yourself; desktop files do not expand it). Preserve all existing flags, `%U`, incognito actions, profile, X11 platform, and scale factor. Quit Chrome completely through its menu and reopen it through that launcher.
+Back up your user desktop launchers, then prefix each application's executable in every `Exec=` line with the absolute path `$HOME/.local/bin/daapstt-ime-run` (expand `$HOME` yourself; desktop files do not expand it). For example, Chrome uses `/home/YOU/.local/bin/daapstt-ime-run /usr/bin/google-chrome-stable` followed by its existing flags. Preserve `%U`, incognito actions, profile, X11 platform, and scale factor. For Discord, use `/home/YOU/.local/bin/daapstt-ime-run /usr/bin/discord --ozone-platform=x11`. Quit each app completely and reopen it through its launcher; opening another window does not reload the IM module.
 
-The wrapper reuses an existing IBus daemon or starts `daapstt-ibus.service`, then starts `daapstt-ime.service`. It scopes `GTK_IM_MODULE=ibus` and `XMODIFIERS=@im=ibus` to Chrome, imports only the graphical display variables, and never replaces another IBus daemon or changes the global Wayland input method. No debug port, page extension, Unicode key simulation, or clipboard replacement is used.
+The shared wrapper reuses an existing IBus daemon or starts `daapstt-ibus.service`, then starts `daapstt-ime.service`. It scopes `GTK_IM_MODULE=ibus` and `XMODIFIERS=@im=ibus` to the launched app, imports only the graphical display variables, and never replaces another IBus daemon or changes the global Wayland input method. No debug port, page extension, Unicode key simulation, or clipboard replacement is used.
 
-Chrome realtime behavior:
+Native IBus realtime behavior:
 
-- Hold Alt+Space: native Unicode preedit appears progressively in the focused field, without a `§` marker. Provider-confirmed segments accumulate in that preedit; no intermediate application commits occur.
-- Release: exactly one native commit inserts the provider-confirmed transcript. A last unconfirmed partial is never promoted to final text.
+- Hold Alt+Space: `§` appears as native preedit, then recognized words replace it progressively. The marker is never included in the final commit. Provider-confirmed segments accumulate in that preedit; no intermediate application commits occur. **Docs may preserve intermediate compositions, including the marker, in its Undo history.**
+- Release: queued audio is drained, the last server segment is explicitly finalized, and exactly one native commit inserts the provider-confirmed transcript as soon as its acknowledgement arrives. There is no fixed three-second grace period for native IBus delivery. Network/recognition latency can still keep the preedit underlined briefly; an unconfirmed partial is never promoted to final text.
+- During composition, Chromium/Docs displays a temporary underline. It disappears on final commit; it is not document formatting. Chromium's GTK transport supplies this underline even when the engine supplies no underline attribute.
 - Change field/tab/window or type manually: the dictation session is invalidated and late results are refused. **Chrome/Docs may retain the visible composition in the old field on focus loss.** The daemon does not delete that text or reopen a session in the new field.
 - An IME failure or ambiguous ACK timeout never retries the commit and never falls back to keyboard injection. A provider failure before any confirmed segment may use batch recognition, but only through the same still-valid IME session.
-- `banana` clipboard insertion is **unsupported in Chrome realtime**: a final transcript containing the placeholder is rejected with a notification, not pasted or typed literally. Non-Chrome clipboard behavior and explicit Batch mode are unchanged.
+- `banana` clipboard insertion is **unsupported in native IBus realtime**: a final transcript containing the placeholder is rejected with a notification, not pasted or typed literally. Keyboard-based clipboard behavior and explicit Batch mode are unchanged.
+
+Native IBus sessions use the provider's manual commit strategy. Audio is segmented at 20 seconds, below its automatic ~36-second boundary, with only one outstanding commit acknowledgement. This prevents an earlier segment from being mistaken for the final answer after release. The three-second acknowledgement timeout is an error bound, not a mandatory delay. Other realtime delivery paths retain VAD segmentation.
 
 The bridge requires an owned `$XDG_RUNTIME_DIR`, uses a private `daapstt/ime.sock` socket, rejects password/PIN contexts when reported, and selects its engine only at dictation start. It does not make every XWayland application an IBus target.
 
@@ -118,7 +121,7 @@ cargo test ime_manual_smoke -- --ignored --nocapture
 python3 -m unittest discover -s contrib/ibus/tests
 ```
 
-If Chrome input is unavailable, focus an editable field and check the bridge service. Opening another Chrome window does not reload its IM module; a full clean browser restart is required. `make install` does not install or enable the optional IBus services.
+If native input is unavailable, focus an editable field and check the bridge service and the app's scoped launcher. Discord must run under XWayland for this path; native Wayland Discord remains deferred. `make install` does not install or enable the optional IBus services.
 
 ## Keyterms
 
@@ -184,7 +187,7 @@ keyd temporarily removes Alt while it emits the internal `F24` event. If Space i
 ## Troubleshooting
 
 - **Alt+Space does not start recording:** Confirm keyd is running with `systemctl status keyd`, then verify the existing `/etc/keyd/default.conf` contains the `[alt]` section and `space = f24` mapping shown above. Restart keyd after changes.
-- **Live text is affected by Alt shortcuts:** Ensure the mapping is in `/etc/keyd/default.conf`, not a separate wildcard configuration. Native Wayland targets receive live edits; non-Chrome XWayland targets use deferred delivery. The Chrome IBus bridge recognizes keyd's F24 by both keysym and normalized Linux hardware code 194, so an XKB layout without an F24 keysym does not treat shortcut repeats as manual typing.
+- **Live text is affected by Alt shortcuts:** Ensure the mapping is in `/etc/keyd/default.conf`, not a separate wildcard configuration. Native Wayland targets receive live edits except Discord; XWayland targets outside Chrome and Discord use deferred delivery. The IBus bridge recognizes keyd's F24 by both keysym and normalized Linux hardware code 194, so an XKB layout without an F24 keysym does not treat shortcut repeats as manual typing.
 - **Chrome preedit disappears on hotkey release:** Modifier-only events (including Control restored during release) must not cancel the session. The bridge consumes those transitions while dictating; an actual non-modifier key or focus change still cancels. Reinstall with `make install-ime` and restart `daapstt-ime` after updating the bridge.
 
 ## Development

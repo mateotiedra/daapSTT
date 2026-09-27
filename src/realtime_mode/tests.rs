@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn chrome_routes_to_ime_before_the_xwayland_fallback() {
+fn supported_apps_route_to_ime_before_the_xwayland_fallback() {
     let window = |class: &str, xwayland| crate::window::ActiveWindow {
         class: class.to_owned(),
         xwayland,
@@ -13,6 +13,7 @@ fn chrome_routes_to_ime_before_the_xwayland_fallback() {
         "google-chrome-unstable",
         "chromium",
         "chromium-browser",
+        "discord",
     ] {
         assert_eq!(
             delivery_for_active_window(Some(&window(class, true))),

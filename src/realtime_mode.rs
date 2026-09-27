@@ -45,7 +45,10 @@ fn realtime_next_step(
 
 fn delivery_for_active_window(window: Option<&crate::window::ActiveWindow>) -> RealtimeDelivery {
     match window {
-        Some(window) if crate::window::is_chrome_class(Some(&window.class)) => {
+        Some(window)
+            if crate::window::is_chrome_class(Some(&window.class))
+                || (window.xwayland && crate::window::is_discord_class(Some(&window.class))) =>
+        {
             RealtimeDelivery::Ime
         }
         Some(window) if crate::window::is_discord_class(Some(&window.class)) || window.xwayland => {
@@ -74,16 +77,16 @@ pub(crate) async fn handle_realtime_press(
             match crate::ime::ImeSession::begin().await {
                 Ok(session) => state.ime_session = Some(session),
                 Err(e) => {
-                    warn!("failed to begin Chrome IME session: {e}");
+                    warn!("failed to begin native IME session: {e}");
                     let _ = notify::error(
                         "Voice daemon",
-                        "Chrome voice input unavailable — check IBus and focus a text field",
+                        "Native voice input unavailable — check IBus and focus a text field",
                     )
                     .await;
                     return;
                 }
             }
-            info!("realtime recording started with Chrome IME delivery");
+            info!("realtime recording started with native IME delivery");
         }
         (RealtimeDelivery::Live, _) => info!("realtime recording started"),
     }
@@ -118,6 +121,7 @@ pub(crate) async fn handle_realtime_press(
             endpoint: config.elevenlabs_realtime_url.clone(),
             api_key: config.elevenlabs_api_key.clone(),
             keyterms,
+            manual_commits: delivery == RealtimeDelivery::Ime,
         },
         Err(e) => {
             warn!("failed to load realtime keyterms: {e}");
@@ -262,7 +266,7 @@ pub(crate) async fn handle_realtime_press(
         if ime_transport_failed {
             let _ = notify::error(
                 "Voice daemon",
-                "Chrome voice input unavailable — dictation was not committed",
+                "Native voice input unavailable — dictation was not committed",
             )
             .await;
         }
@@ -357,7 +361,7 @@ pub(crate) async fn handle_realtime_press(
         if ime_transport_failed {
             let _ = notify::error(
                 "Voice daemon",
-                "Chrome voice input unavailable — dictation was not committed",
+                "Native voice input unavailable — dictation was not committed",
             )
             .await;
         }
@@ -535,7 +539,7 @@ async fn apply_ime_live_text(
     };
     let preedit = visible_ime_preedit(&transition.next);
     if let Err(e) = session.partial(&preedit).await {
-        warn!("failed to update Chrome IME preedit: {e}");
+        warn!("failed to update native IME preedit: {e}");
         *ime_cancelled = ime_error_is_expected_cancellation(&e);
         *failed = Some(realtime::RealtimeError::TaskFailed);
         *tail_safe = false;
@@ -662,7 +666,7 @@ async fn cleanup_live_tail(
             return false;
         };
         if let Err(e) = session.clear().await {
-            warn!("failed to clear Chrome IME preedit: {e}");
+            warn!("failed to clear native IME preedit: {e}");
             return false;
         }
         *live_text = transition.next;
@@ -816,7 +820,7 @@ async fn finish_ime_result(
     } else if !state.commit_ime(&confirmed).await {
         let _ = notify::error(
             "Voice daemon",
-            "Chrome voice input unavailable — dictation was not committed",
+            "Native voice input unavailable — dictation was not committed",
         )
         .await;
     }
@@ -824,7 +828,7 @@ async fn finish_ime_result(
     if unsupported_placeholder {
         let _ = notify::error(
             "Voice daemon",
-            "Clipboard placeholder is unsupported in Chrome voice input",
+            "Clipboard placeholder is unsupported in native voice input",
         )
         .await;
     } else if let Some(error) = failed.as_ref() {
