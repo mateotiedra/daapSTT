@@ -10,7 +10,13 @@ use crate::placeholder::TranscriptChunk;
 /// Type the marker character into the active window.
 pub async fn type_marker(marker: &str) -> Result<()> {
     debug!("typing marker");
-    type_with_wtype(marker, "marker").await
+    // wtype maps its first keysym to physical Escape. Chrome drops § there;
+    // reserve that slot with an unpressed Escape release before the marker.
+    let mut command = Command::new("wtype");
+    command
+        .args(["-p", "Escape", "-"])
+        .stdin(std::process::Stdio::piped());
+    run_command_with_text(command, marker, "marker").await
 }
 
 /// Backspace to remove the marker character.
@@ -152,10 +158,6 @@ fn paste_args(shortcut: PasteShortcut) -> &'static [&'static str] {
     }
 }
 
-async fn type_with_wtype(text: &str, operation: &str) -> Result<()> {
-    type_with_wtype_delay(text, operation, None).await
-}
-
 async fn type_with_wtype_delay(text: &str, operation: &str, delay_ms: Option<u64>) -> Result<()> {
     let mut command = Command::new("wtype");
     command
@@ -258,12 +260,6 @@ mod tests {
             ),
             ("\"", "\"")
         );
-    }
-
-    #[test]
-    fn transcript_typing_has_exactly_one_stdin_placeholder() {
-        assert_eq!(type_args(None), ["-"]);
-        assert_eq!(type_args(Some(3)), ["-d", "3", "-"]);
     }
 
     #[test]

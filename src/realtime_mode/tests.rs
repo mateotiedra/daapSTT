@@ -13,14 +13,22 @@ fn supported_apps_route_to_ime_before_the_xwayland_fallback() {
         "google-chrome-unstable",
         "chromium",
         "chromium-browser",
-        "discord",
     ] {
         assert_eq!(
             delivery_for_active_window(Some(&window(class, true))),
             RealtimeDelivery::Ime,
             "{class}"
         );
+        assert_eq!(
+            delivery_for_active_window(Some(&window(class, false))),
+            RealtimeDelivery::Live,
+            "{class}"
+        );
     }
+    assert_eq!(
+        delivery_for_active_window(Some(&window("discord", true))),
+        RealtimeDelivery::Ime
+    );
     assert_eq!(
         delivery_for_active_window(Some(&window("discord", false))),
         RealtimeDelivery::Deferred

@@ -72,7 +72,9 @@ The daemon also mutes other apps' currently active microphone capture streams wh
 
 Outside native IBus realtime, speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. Text is wrapped in double quotes, while images get one space before and after. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. Live keyboard delivery pastes when recognition becomes a stable committed segment. Deferred and Batch delivery wait until their final delivery phase.
 
-Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. Native Wayland windows receive live edits through `wtype`. Chrome/Chromium and XWayland Discord use the opt-in native IBus transport below. Other XWayland windows and native Wayland Discord retain deferred delivery: no marker or partial text while Alt+Space is held, then the stable transcript after Alt is released.
+Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. Native Wayland windows, including Chrome/Chromium, receive live edits through `wtype`. XWayland Chrome/Chromium and Discord use the opt-in native IBus transport below. Other XWayland windows and native Wayland Discord retain deferred delivery: no marker or partial text while Alt+Space is held, then the stable transcript after Alt is released.
+
+Keyboard delivery inserts `§` at recording start and removes it before inserting the first transcript. Marker injection reserves `wtype`'s first keycode for Escape, preventing native Wayland Chrome from interpreting `§` as the physical Escape key and silently dropping it.
 
 ```bash
 daapstt realtime on      # Enable realtime and restart the user service
@@ -86,7 +88,7 @@ For live keyboard delivery outside native IBus targets, the current partial tran
 
 For keyboard-based realtime delivery, if recognition fails before any committed text appears, the provisional partial is removed and the buffered recording falls back to batch transcription after release. If it fails after a commit, the mutable tail is removed, committed text is kept, and the recording is not batch-transcribed again, avoiding duplicate output. Explicit Batch mode behavior is unchanged.
 
-### Chrome and Discord native voice input
+### XWayland Chrome and Discord native voice input
 
 Install the optional bridge separately from the daemon:
 
