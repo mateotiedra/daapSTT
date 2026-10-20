@@ -7,15 +7,19 @@ use tokio::process::Command;
 use crate::clipboard::{self, PastePlan, PasteShortcut};
 use crate::placeholder::TranscriptChunk;
 
+fn wtype_command() -> Command {
+    // wtype maps its first keysym to physical Escape. Native Wayland Chrome
+    // drops spaces and § there; reserve it with a release, never an Escape press.
+    let mut command = Command::new("wtype");
+    command.args(["-p", "Escape"]);
+    command
+}
+
 /// Type the marker character into the active window.
 pub async fn type_marker(marker: &str) -> Result<()> {
     debug!("typing marker");
-    // wtype maps its first keysym to physical Escape. Chrome drops § there;
-    // reserve that slot with an unpressed Escape release before the marker.
-    let mut command = Command::new("wtype");
-    command
-        .args(["-p", "Escape", "-"])
-        .stdin(std::process::Stdio::piped());
+    let mut command = wtype_command();
+    command.arg("-").stdin(std::process::Stdio::piped());
     run_command_with_text(command, marker, "marker").await
 }
 
@@ -35,7 +39,7 @@ pub async fn apply_realtime_edit(backspaces: usize, text: &str) -> Result<()> {
     }
 
     debug!("applying realtime edit: {backspaces} backspaces");
-    let mut command = Command::new("wtype");
+    let mut command = wtype_command();
     for arg in backspace_args(backspaces) {
         command.arg(arg);
     }
@@ -159,7 +163,7 @@ fn paste_args(shortcut: PasteShortcut) -> &'static [&'static str] {
 }
 
 async fn type_with_wtype_delay(text: &str, operation: &str, delay_ms: Option<u64>) -> Result<()> {
-    let mut command = Command::new("wtype");
+    let mut command = wtype_command();
     command
         .args(type_args(delay_ms))
         .stdin(std::process::Stdio::piped());
@@ -174,7 +178,7 @@ fn type_args(delay_ms: Option<u64>) -> Vec<String> {
 }
 
 async fn run_wtype(args: &[&str], operation: &str) -> Result<()> {
-    let mut command = Command::new("wtype");
+    let mut command = wtype_command();
     command.args(args).stdin(std::process::Stdio::null());
     run_command(command, operation).await
 }

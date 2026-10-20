@@ -1,0 +1,9 @@
+[Unit]
+Description=DaapSTT IBus Wayland input-method frontend
+After=daapstt-ibus.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/daapstt/ibus-wayland
+Restart=on-failure
+RestartSec=1

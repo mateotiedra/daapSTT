@@ -208,6 +208,19 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(bridge.sent[-1]["session"], 1)
         self.assertTrue(bridge.sent[-1]["ok"])
 
+    def test_protected_content_type_invalidates_active_session(self):
+        for purpose in (FakeIBus.InputPurpose.PASSWORD, FakeIBus.InputPurpose.PIN):
+            with self.subTest(purpose=purpose):
+                bridge = self.make_bridge()
+                active = self.activate(bridge)
+                active.bridge = bridge
+                DictationEngine.bridge = bridge
+                DictationEngine.do_set_content_type(active, purpose, 0)
+                bridge.handle({"v": 1, "id": 1, "op": "commit", "session": 1, "text": "late"})
+                self.assertIsNone(bridge.session)
+                self.assertEqual(active.commits, [])
+                self.assertFalse(bridge.sent[-1]["ok"])
+
     def test_focus_change_clears_preview_and_invalidates_immediately(self):
         bridge = self.make_bridge()
         active = self.activate(bridge, token=4)

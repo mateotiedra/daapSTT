@@ -1,0 +1,182 @@
+--- a/client/wayland/ibuswaylandim.c
++++ b/client/wayland/ibuswaylandim.c
+@@ -27,6 +27,7 @@
+ #include <glib-object.h>
+ #include <ibus.h>
+ #include <ibusinternal.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/time.h>
+ #include <wayland-client.h>
+@@ -35,6 +36,7 @@
+ #include "input-method-unstable-v1-client-protocol.h"
+ #include "input-method-unstable-v2-client-protocol.h"
+ #include "text-input-unstable-v1-client-protocol.h"
++#include "text-input-unstable-v3-client-protocol.h"
+ #include "virtual-keyboard-unstable-v1-client-protocol.h"
+ #include "ibuswaylandim.h"
+ 
+@@ -94,6 +96,8 @@
+     gboolean active;
+     gboolean pending_activate;
+     gboolean pending_deactivate;
++    IBusInputHints pending_hints;
++    IBusInputPurpose pending_purpose;
+ };
+ 
+ typedef struct _IBusWaylandIMPrivate IBusWaylandIMPrivate;
+@@ -123,6 +127,8 @@
+     guint preedit_cursor_pos;
+     guint preedit_mode;
+     IBusModifierType modifiers;
++    IBusInputHints ibus_hints;
++    IBusInputPurpose ibus_purpose;
+ 
+     struct xkb_context *xkb_context;
+ 
+@@ -916,11 +922,14 @@
+     g_return_if_fail (IBUS_IS_WAYLAND_IM (wlim));
+     priv = ibus_wayland_im_get_instance_private (wlim);
+     desc = ibus_bus_get_global_engine (bus);
+-    g_assert (desc);
+-    g_assert (!g_strcmp0 (ibus_engine_desc_get_name (desc), engine_name));
++    /* The signal names an earlier transition. The synchronous query may
++     * already observe a newer engine; its descriptor is authoritative. */
++    if (!desc)
++        return;
+     keymap = create_user_xkb_keymap (priv->xkb_context, desc);
+     if (keymap && !ibus_wayland_im_update_xkb_state (wlim, keymap))
+         xkb_keymap_unref (keymap);
++    g_object_unref (desc);
+ }
+ 
+ 
+@@ -1780,6 +1789,10 @@
+             ibus_input_context_set_post_process_key_event (priv->ibuscontext,
+                                                            TRUE);
+         }
++        /* Set this before FocusIn can replay the context state to an engine. */
++        ibus_input_context_set_content_type (priv->ibuscontext,
++                                             priv->ibus_purpose,
++                                             priv->ibus_hints);
+         ibus_input_context_focus_in (priv->ibuscontext);
+         g_signal_emit (wlim,
+                        wayland_im_signals[IBUS_FOCUS_IN],
+@@ -1945,6 +1958,9 @@
+     g_return_if_fail (IBUS_IS_WAYLAND_IM (wlim));
+     priv = ibus_wayland_im_get_instance_private (wlim);
+     priv->seat->pending_activate = TRUE;
++    /* activate resets the double-buffered content state (protocol v2). */
++    priv->seat->pending_hints = IBUS_INPUT_HINT_NONE;
++    priv->seat->pending_purpose = IBUS_INPUT_PURPOSE_FREE_FORM;
+ }
+ 
+ 
+@@ -1985,9 +2001,83 @@
+ static void
+ input_method_content_type_v2 (void                       *data,
+                               struct zwp_input_method_v2 *input_method_v2,
+-                              uint32_t                    hint,
++                              uint32_t                    hints,
+                               uint32_t                    purpose)
+ {
++    IBusWaylandIM *wlim = data;
++    IBusWaylandIMPrivate *priv;
++    IBusInputHints ibus_hints = IBUS_INPUT_HINT_NONE;
++    IBusInputPurpose ibus_purpose = IBUS_INPUT_PURPOSE_FREE_FORM;
++
++    g_return_if_fail (IBUS_IS_WAYLAND_IM (wlim));
++    priv = ibus_wayland_im_get_instance_private (wlim);
++
++    /* Backported from upstream main; v2 uses text-input-v3 enum values. */
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_COMPLETION)
++        ibus_hints |= IBUS_INPUT_HINT_WORD_COMPLETION;
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_SPELLCHECK)
++        ibus_hints |= IBUS_INPUT_HINT_SPELLCHECK;
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_AUTO_CAPITALIZATION)
++        ibus_hints |= IBUS_INPUT_HINT_UPPERCASE_SENTENCES;
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_LOWERCASE)
++        ibus_hints |= IBUS_INPUT_HINT_LOWERCASE;
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_UPPERCASE)
++        ibus_hints |= IBUS_INPUT_HINT_UPPERCASE_CHARS;
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_TITLECASE)
++        ibus_hints |= IBUS_INPUT_HINT_UPPERCASE_WORDS;
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_HIDDEN_TEXT)
++        ibus_hints |= IBUS_INPUT_HINT_PRIVATE;
++    if (hints & ZWP_TEXT_INPUT_V3_CONTENT_HINT_SENSITIVE_DATA)
++        ibus_hints |= IBUS_INPUT_HINT_PRIVATE;
++    /* IBus 1.5.32 has no LATIN or MULTILINE hint equivalents. */
++
++    switch (purpose) {
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL:
++        ibus_purpose = IBUS_INPUT_PURPOSE_FREE_FORM;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_ALPHA:
++        ibus_purpose = IBUS_INPUT_PURPOSE_ALPHA;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_DIGITS:
++        ibus_purpose = IBUS_INPUT_PURPOSE_DIGITS;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NUMBER:
++        ibus_purpose = IBUS_INPUT_PURPOSE_NUMBER;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_PHONE:
++        ibus_purpose = IBUS_INPUT_PURPOSE_PHONE;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_URL:
++        ibus_purpose = IBUS_INPUT_PURPOSE_URL;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_EMAIL:
++        ibus_purpose = IBUS_INPUT_PURPOSE_EMAIL;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NAME:
++        ibus_purpose = IBUS_INPUT_PURPOSE_NAME;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_PASSWORD:
++        ibus_purpose = IBUS_INPUT_PURPOSE_PASSWORD;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_PIN:
++        ibus_purpose = IBUS_INPUT_PURPOSE_PIN;
++        break;
++    /* These purposes have no IBus 1.5.32 equivalents. */
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_DATE:
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_TIME:
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_DATETIME:
++        ibus_purpose = IBUS_INPUT_PURPOSE_FREE_FORM;
++        break;
++    case ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_TERMINAL:
++        ibus_purpose = IBUS_INPUT_PURPOSE_TERMINAL;
++        break;
++    default:
++        g_warning ("Wrong purpose in the input-method context: %d", purpose);
++    }
++
++    /* Do not expose pending content to IBus until the matching v2 done. */
++    priv->seat->pending_hints = ibus_hints;
++    priv->seat->pending_purpose = ibus_purpose;
+ }
+ 
+ 
+@@ -2003,6 +2093,12 @@
+     priv = ibus_wayland_im_get_instance_private (wlim);
+     priv->serial++;
+     input_method.u.input_method_v2 = input_method_v2;
++    priv->ibus_hints = priv->seat->pending_hints;
++    priv->ibus_purpose = priv->seat->pending_purpose;
++    if (priv->ibuscontext)
++        ibus_input_context_set_content_type (priv->ibuscontext,
++                                             priv->ibus_purpose,
++                                             priv->ibus_hints);
+ 
+     if (priv->seat->pending_activate && !priv->seat->active) {
+         priv->seat->active = TRUE;
+@@ -2020,6 +2116,9 @@
+ input_method_unavailable_v2 (void                       *data,
+                              struct zwp_input_method_v2 *input_method_v2)
+ {
++    g_printerr ("IBus Wayland input method unavailable: compositor refused "
++                "seat ownership (another input method may already own it).\n");
++    exit (EXIT_FAILURE);
+ }
+ 
+ 

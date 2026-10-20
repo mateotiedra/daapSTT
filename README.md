@@ -72,9 +72,9 @@ The daemon also mutes other apps' currently active microphone capture streams wh
 
 Outside native IBus realtime, speaking standalone `banana` (case-insensitive) triggers a native clipboard paste rather than typing a replacement. Text is wrapped in double quotes, while images get one space before and after. It supports multiline text and images; text uses **Ctrl+Shift+V** only in Kitty and **Ctrl+V** in every other app, while images use **Ctrl+V**. All occurrences are recognized, including punctuation-adjacent ones but not those inside longer words. Live keyboard delivery pastes when recognition becomes a stable committed segment. Deferred and Batch delivery wait until their final delivery phase.
 
-Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. Native Wayland windows, including Chrome/Chromium, receive live edits through `wtype`. XWayland Chrome/Chromium and Discord use the opt-in native IBus transport below. Other XWayland windows and native Wayland Discord retain deferred delivery: no marker or partial text while Alt+Space is held, then the stable transcript after Alt is released.
+Realtime mode streams audio to Scribe v2 Realtime and displays live partial text while you speak. It removes filler words, false starts, and non-speech sounds. Chrome/Chromium on native Wayland or XWayland and Discord on XWayland use the opt-in native IBus transport below. Other native Wayland windows receive live keyboard edits through `wtype`. Other XWayland windows and native Wayland Discord retain deferred delivery: no marker or partial text while Alt+Space is held, then the stable transcript after Alt is released.
 
-Keyboard delivery inserts `§` at recording start and removes it before inserting the first transcript. Marker injection reserves `wtype`'s first keycode for Escape, preventing native Wayland Chrome from interpreting `§` as the physical Escape key and silently dropping it.
+Keyboard delivery inserts `§` at recording start and removes it before inserting the first transcript. Chrome never uses this path: physical-key mappings can drop spaces, trigger shortcuts or corrupt non-BMP characters. A missing or failed Chrome IME session is reported, without recording on begin failure and without keyboard fallback.
 
 ```bash
 daapstt realtime on      # Enable realtime and restart the user service
@@ -88,24 +88,27 @@ For live keyboard delivery outside native IBus targets, the current partial tran
 
 For keyboard-based realtime delivery, if recognition fails before any committed text appears, the provisional partial is removed and the buffered recording falls back to batch transcription after release. If it fails after a commit, the mutable tail is removed, committed text is kept, and the recording is not batch-transcribed again, avoiding duplicate output. Explicit Batch mode behavior is unchanged.
 
-### XWayland Chrome and Discord native voice input
+### Native Wayland Chrome and XWayland Chrome/Discord voice input
 
 Install the optional bridge separately from the daemon:
 
 ```bash
-sudo apt-get install ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 python3-gi
+sudo apt-get install ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 python3-gi gcc pkg-config patch libglib2.0-dev libwayland-dev libxkbcommon-dev wayland-protocols
 make install-ime
 ```
 
-Back up your user desktop launchers, then prefix each application's executable in every `Exec=` line with the absolute path `$HOME/.local/bin/daapstt-ime-run` (expand `$HOME` yourself; desktop files do not expand it). For example, Chrome uses `/home/YOU/.local/bin/daapstt-ime-run /usr/bin/google-chrome-stable` followed by its existing flags. Preserve `%U`, incognito actions, profile, X11 platform, and scale factor. For Discord, use `/usr/bin/env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 /home/YOU/.local/bin/daapstt-ime-run /usr/bin/discord --ozone-platform=x11`. This scopes the X11 environment to Discord and its child processes: its updater can restart the app without forwarding command-line flags, so the X11 session type and absence of a Wayland display must also survive in the inherited environment. Launching `/usr/bin/discord` directly bypasses this configuration. Quit each app completely and reopen it through its launcher; opening another window does not reload the IM module.
+Back up your user desktop launchers, then prefix each application's executable in every `Exec=` line with the absolute path `$HOME/.local/bin/daapstt-ime-run` (expand `$HOME` yourself; desktop files do not expand it). Native Wayland Chrome uses `/home/YOU/.local/bin/daapstt-ime-run /usr/bin/google-chrome-stable --ozone-platform=wayland --enable-wayland-ime --wayland-ime-version=3`. Preserve `%U`, incognito actions, profile and scale factor. For Discord, keep `/usr/bin/env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 /home/YOU/.local/bin/daapstt-ime-run /usr/bin/discord --ozone-platform=x11`: its updater can restart without forwarding flags, so the X11 environment must survive in child processes. Quit each app normally after saving work and reopen it through its launcher; opening another window does not reload IME flags.
 
-The shared wrapper reuses an existing IBus daemon or starts `daapstt-ibus.service`, then starts `daapstt-ime.service`. It scopes `GTK_IM_MODULE=ibus` and `XMODIFIERS=@im=ibus` to the launched app, imports only the graphical display variables, and never replaces another IBus daemon or changes the global Wayland input method. No debug port, page extension, Unicode key simulation, or clipboard replacement is used.
+The shared wrapper reuses an existing IBus daemon or starts `daapstt-ibus.service`, then starts `daapstt-ime.service`. When `WAYLAND_DISPLAY` is set and the arguments contain exactly `--ozone-platform=wayland` and `--enable-wayland-ime`, it also starts `daapstt-ibus-wayland.service`. This frontend owns the seat's input-method-v2 role; do not run it alongside another seat input method. It never replaces the bus, changes global keyboard preferences or adds flags to other applications. Frontend startup failure warns independently of bridge socket readiness, then opens the application normally. `GTK_IM_MODULE=ibus` and `XMODIFIERS=@im=ibus` remain scoped to the launched application.
+
+`make install-ime` builds an isolated upstream IBus 1.5.32 Wayland frontend against Ubuntu amd64 `libibus-1.0-5` version `1.5.32-2build1`. Source and extracted development headers are checksum-pinned; no system packages or libraries are replaced. The patch forwards double-buffered v2 content purposes/hints (including password/PIN) and handles rapid engine-change notifications using the current engine descriptor. The stock 1.5.32 GTK frontend discards content types and can assert during rapid engine changes, so it is not used. Build artifacts remain under `target/ibus-wayland`; an incompatible installed IBus ABI fails the build explicitly. The standalone frontend has no GTK candidate popup and is intended for this composition engine.
 
 Native IBus realtime behavior:
 
 - Hold Alt+Space: `§` appears as native preedit, then recognized words replace it progressively. The marker is never included in the final commit. Provider-confirmed segments accumulate in that preedit; no intermediate application commits occur. **Docs may preserve intermediate compositions, including the marker, in its Undo history.**
 - Release: queued audio is drained, the last server segment is explicitly finalized, and exactly one native commit inserts the provider-confirmed transcript as soon as its acknowledgement arrives. There is no fixed three-second grace period for native IBus delivery. Network/recognition latency can still keep the preedit underlined briefly; an unconfirmed partial is never promoted to final text.
 - During composition, Chromium/Docs displays a temporary underline. It disappears on final commit; it is not document formatting. Chromium's GTK transport supplies this underline even when the engine supplies no underline attribute.
+- Native Chrome's rich-text editor may normalize ordinary spaces to non-breaking spaces to preserve their visible layout. Textarea Unicode scalars remain exact; rich-text space normalization is accepted.
 - Change field/tab/window or type manually: the dictation session is invalidated and late results are refused. **Chrome/Docs may retain the visible composition in the old field on focus loss.** The daemon does not delete that text or reopen a session in the new field.
 - An IME failure or ambiguous ACK timeout never retries the commit and never falls back to keyboard injection. A provider failure before any confirmed segment may use batch recognition, but only through the same still-valid IME session.
 - `banana` clipboard insertion is **unsupported in native IBus realtime**: a final transcript containing the placeholder is rejected with a notification, not pasted or typed literally. Keyboard-based clipboard behavior and explicit Batch mode are unchanged.
@@ -115,8 +118,8 @@ Native IBus sessions use the provider's manual commit strategy. Audio is segment
 The bridge requires an owned `$XDG_RUNTIME_DIR`, uses a private `daapstt/ime.sock` socket, rejects password/PIN contexts when reported, and selects its engine only at dictation start. It does not make every XWayland application an IBus target.
 
 ```bash
-systemctl --user status daapstt-ibus daapstt-ime voice-daemon
-journalctl --user -u daapstt-ime -u voice-daemon -f
+systemctl --user status daapstt-ibus daapstt-ime daapstt-ibus-wayland voice-daemon
+journalctl --user -u daapstt-ime -u daapstt-ibus-wayland -u voice-daemon -f
 # Both manual probes modify the focused field after a five-second pause:
 python3 contrib/ibus/smoke.py
 cargo test ime_manual_smoke -- --ignored --nocapture

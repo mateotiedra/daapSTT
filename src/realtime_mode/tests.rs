@@ -14,33 +14,28 @@ fn supported_apps_route_to_ime_before_the_xwayland_fallback() {
         "chromium",
         "chromium-browser",
     ] {
+        for xwayland in [false, true] {
+            assert_eq!(
+                delivery_for_active_window(Some(&window(class, xwayland))),
+                RealtimeDelivery::Ime,
+                "{class}, xwayland={xwayland}"
+            );
+        }
+    }
+    for (class, xwayland, expected) in [
+        ("discord", true, RealtimeDelivery::Ime),
+        ("discord", false, RealtimeDelivery::Deferred),
+        ("google-chrome-stable", true, RealtimeDelivery::Deferred),
+        ("firefox", false, RealtimeDelivery::Live),
+        ("firefox", true, RealtimeDelivery::Deferred),
+        ("kitty", false, RealtimeDelivery::Live),
+    ] {
         assert_eq!(
-            delivery_for_active_window(Some(&window(class, true))),
-            RealtimeDelivery::Ime,
-            "{class}"
-        );
-        assert_eq!(
-            delivery_for_active_window(Some(&window(class, false))),
-            RealtimeDelivery::Live,
-            "{class}"
+            delivery_for_active_window(Some(&window(class, xwayland))),
+            expected,
+            "{class}, xwayland={xwayland}"
         );
     }
-    assert_eq!(
-        delivery_for_active_window(Some(&window("discord", true))),
-        RealtimeDelivery::Ime
-    );
-    assert_eq!(
-        delivery_for_active_window(Some(&window("discord", false))),
-        RealtimeDelivery::Deferred
-    );
-    assert_eq!(
-        delivery_for_active_window(Some(&window("google-chrome-stable", true))),
-        RealtimeDelivery::Deferred
-    );
-    assert_eq!(
-        delivery_for_active_window(Some(&window("firefox", false))),
-        RealtimeDelivery::Live
-    );
     assert_eq!(delivery_for_active_window(None), RealtimeDelivery::Deferred);
 }
 

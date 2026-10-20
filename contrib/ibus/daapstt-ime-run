@@ -9,8 +9,21 @@ done
 if ! /usr/bin/python3 -c 'import gi; gi.require_version("IBus", "1.0"); from gi.repository import IBus; IBus.init(); raise SystemExit(not IBus.Bus().is_connected())'; then
     systemctl --user start daapstt-ibus.service || true
 fi
+ime_failed=0
+native_wayland=0
+wayland_ime=0
+for argument in "$@"; do
+    case "$argument" in
+        --ozone-platform=wayland) native_wayland=1 ;;
+        --enable-wayland-ime) wayland_ime=1 ;;
+    esac
+done
+if [ -n "${WAYLAND_DISPLAY:-}" ] && [ "$native_wayland" -eq 1 ] && [ "$wayland_ime" -eq 1 ]; then
+    systemctl --user start daapstt-ibus-wayland.service &&
+        systemctl --user is-active --quiet daapstt-ibus-wayland.service || ime_failed=1
+fi
 systemctl --user start daapstt-ime.service || true
-if ! /usr/bin/python3 - <<'PY'
+if [ "$ime_failed" -ne 0 ] || ! /usr/bin/python3 - <<'PY'
 import os
 import socket
 import stat

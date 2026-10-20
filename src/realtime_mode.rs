@@ -46,9 +46,8 @@ fn realtime_next_step(
 fn delivery_for_active_window(window: Option<&crate::window::ActiveWindow>) -> RealtimeDelivery {
     match window {
         Some(window)
-            if window.xwayland
-                && (crate::window::is_chrome_class(Some(&window.class))
-                    || crate::window::is_discord_class(Some(&window.class))) =>
+            if crate::window::is_chrome_class(Some(&window.class))
+                || (window.xwayland && crate::window::is_discord_class(Some(&window.class))) =>
         {
             RealtimeDelivery::Ime
         }

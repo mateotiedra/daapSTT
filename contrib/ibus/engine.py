@@ -70,6 +70,8 @@ class DictationEngine(IBus.EngineSimple):
 
     def do_set_content_type(self, purpose, hints):
         self.purpose = purpose
+        if purpose in (IBus.InputPurpose.PASSWORD, IBus.InputPurpose.PIN):
+            self.bridge.engine_invalidated("no_context", self)
 
     def do_process_key_event(self, keyval, keycode, state):
         if self.bridge.is_active_engine(self):
@@ -474,7 +476,8 @@ class Bridge:
         if self.focused_context == pending["context"] and self.focused_engine is not None:
             pending["engine"] = self.focused_engine
             pending["generation"] = self.focused_engine.generation
-        self.complete_begin()
+        # Drain queued engine property updates before checking the field type.
+        GLib.idle_add(self.complete_begin)
 
     def valid(self, request):
         return (
