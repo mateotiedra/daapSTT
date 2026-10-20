@@ -54,7 +54,8 @@ install-ime:
 	/usr/bin/python3 contrib/ibus/build-wayland-frontend.py --work-dir target/ibus-wayland
 	install -d -m 700 $(IME_LIB_DIR)
 	install -m 755 contrib/ibus/engine.py $(IME_LIB_DIR)/ibus_engine.py
-	install -m 755 target/ibus-wayland/ibus-wayland $(IME_LIB_DIR)/ibus-wayland
+	install -m 755 target/ibus-wayland/ibus-wayland $(IME_LIB_DIR)/.ibus-wayland.new
+	mv -f $(IME_LIB_DIR)/.ibus-wayland.new $(IME_LIB_DIR)/ibus-wayland
 	install -d $(BIN_DIR) $(SERVICE_DIR)
 	install -m 755 contrib/ibus/daapstt-ime-run $(BIN_DIR)/daapstt-ime-run
 	install -m 644 contrib/ibus/daapstt-ibus.service $(SERVICE_DIR)/daapstt-ibus.service

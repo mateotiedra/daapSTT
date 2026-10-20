@@ -34,9 +34,46 @@
  
      struct xkb_context *xkb_context;
  
-@@ -916,11 +922,14 @@
+@@ -613,6 +619,8 @@
+     }
+ }
+ 
++static const struct zwp_input_method_keyboard_grab_v2_listener keyboard_listener_v2;
++
+ static void
+ _context_show_preedit_text_cb (IBusInputContext *context,
+                                IBusWaylandIM    *wlim)
+@@ -641,6 +649,13 @@
+                                                     commit);
+         break;
+     case INPUT_METHOD_V2:
++        if (priv->seat->active && !priv->seat->keyboard_v2 &&
++            priv->preedit_text->text[0]) {
++            priv->seat->keyboard_v2 = zwp_input_method_v2_grab_keyboard (
++                    priv->seat->input_method_v2);
++            zwp_input_method_keyboard_grab_v2_add_listener (
++                    priv->seat->keyboard_v2, &keyboard_listener_v2, wlim);
++        }
+         zwp_input_method_v2_set_preedit_string  (
+                 priv->seat->input_method_v2,
+                 priv->preedit_text->text,
+@@ -669,6 +684,8 @@
+                                                     "");
+         break;
+     case INPUT_METHOD_V2:
++        g_clear_pointer (&priv->seat->keyboard_v2,
++                         zwp_input_method_keyboard_grab_v2_release);
+         zwp_input_method_v2_set_preedit_string  (priv->seat->input_method_v2,
+                                                  "", 0, 0);
+         zwp_input_method_v2_commit (priv->seat->input_method_v2, priv->serial);
+@@ -915,12 +932,19 @@
+     g_return_if_fail (IBUS_IS_BUS (bus));
      g_return_if_fail (IBUS_IS_WAYLAND_IM (wlim));
      priv = ibus_wayland_im_get_instance_private (wlim);
++    /* This frontend follows the compositor's layout, including virtual
++     * keyboard maps. Engine selection must not replace that physical map. */
++    if (priv->state_system)
++        return;
      desc = ibus_bus_get_global_engine (bus);
 -    g_assert (desc);
 -    g_assert (!g_strcmp0 (ibus_engine_desc_get_name (desc), engine_name));
@@ -51,7 +88,74 @@
  }
  
  
-@@ -1780,6 +1789,10 @@
+@@ -937,18 +961,22 @@
+ 
+     g_return_if_fail (IBUS_IS_WAYLAND_IM (wlim));
+     priv = ibus_wayland_im_get_instance_private (wlim);
++    /* The compositor keymap also describes temporary virtual keyboards.
++     * Refresh it on every event; wtype changes its map for each invocation. */
+ 
+     if (priv->version != INPUT_METHOD_V1) {
+         zwp_virtual_keyboard_v1_keymap (priv->seat->virtual_keyboard,
+                                         format, fd, size);
+     }
+-    if (priv->keymap && priv->state && priv->state_system)
+-        return;
+     keymap = create_system_xkb_keymap (priv->xkb_context, format, fd, size);
+-    if (keymap && !ibus_wayland_im_update_xkb_state (wlim, keymap))
++    if (!keymap)
++        return;
++    if (!ibus_wayland_im_update_xkb_state (wlim, keymap)) {
+         xkb_keymap_unref (keymap);
+-    if (priv->state)
+-        priv->state_system = xkb_state_ref (priv->state);
++        return;
++    }
++    g_clear_pointer (&priv->state_system, xkb_state_unref);
++    priv->state_system = xkb_state_ref (priv->state);
+ }
+ 
+ 
+@@ -960,7 +988,8 @@
+     g_free (seat->name);
+     zwp_input_popup_surface_v2_destroy (seat->input_popup_surface);
+     zwp_virtual_keyboard_v1_destroy (seat->virtual_keyboard);
+-    zwp_input_method_keyboard_grab_v2_destroy (seat->keyboard_v2);
++    if (seat->keyboard_v2)
++        zwp_input_method_keyboard_grab_v2_destroy (seat->keyboard_v2);
+     zwp_input_method_v2_destroy (seat->input_method_v2);
+     g_slice_free (IBusWaylandSeat, seat);
+ }
+@@ -993,7 +1022,6 @@
+ {
+     IBusWaylandIMPrivate *priv;
+     uint32_t code = key + 8;
+-    uint32_t ch;
+ 
+     g_return_val_if_fail (IBUS_IS_WAYLAND_IM (wlim), FALSE);
+     priv = ibus_wayland_im_get_instance_private (wlim);
+@@ -1013,17 +1041,9 @@
+     }
+     if (!priv->state)
+         return FALSE;
+-    if (!filtered && (state != WL_KEYBOARD_KEY_STATE_RELEASED)) {
+-        ch = xkb_state_key_get_utf32 (priv->state, code);
+-        if (!(modifiers & IBUS_MODIFIER_MASK & ~IBUS_SHIFT_MASK) &&
+-            ch && ch != '\n' && ch != '\b' && ch != '\r' && ch != '\t' &&
+-            ch != '\033' && ch != '\x7f') {
+-            gchar buff[8] = { 0, };
+-            buff[g_unichar_to_utf8 (ch, buff)] = '\0';
+-            ibus_wayland_im_commit_text (wlim, buff);
+-            filtered = TRUE;
+-        }
+-    }
++    /* The output keyboard carries the compositor's exact keymap. Leave
++     * unhandled input as key events, not IME commits: terminal keyboard
++     * delivery and shortcuts must retain their original semantics. */
+     xkb_state_update_key (priv->state, code,
+                           (state == WL_KEYBOARD_KEY_STATE_RELEASED)
+                           ? XKB_KEY_UP : XKB_KEY_DOWN);
+@@ -1780,6 +1800,10 @@
              ibus_input_context_set_post_process_key_event (priv->ibuscontext,
                                                             TRUE);
          }
@@ -62,7 +166,33 @@
          ibus_input_context_focus_in (priv->ibuscontext);
          g_signal_emit (wlim,
                         wayland_im_signals[IBUS_FOCUS_IN],
-@@ -1945,6 +1958,9 @@
+@@ -1818,12 +1842,8 @@
+                                   wlim);
+         break;
+     case INPUT_METHOD_V2:
+-        priv->seat->keyboard_v2 = zwp_input_method_v2_grab_keyboard (
+-                input_method->u.input_method_v2);
+-        zwp_input_method_keyboard_grab_v2_add_listener (
+-                priv->seat->keyboard_v2,
+-                &keyboard_listener_v2,
+-                wlim);
++        /* Idle clients, including wtype-driven terminals, keep their direct
++         * keyboard path. Capture keys only while a preedit is visible. */
+         break;
+     default:
+         g_assert_not_reached ();
+@@ -1904,8 +1924,8 @@
+         }
+         break;
+     case INPUT_METHOD_V2:
+-        if (priv->seat->keyboard_v2)
+-            zwp_input_method_keyboard_grab_v2_release (priv->seat->keyboard_v2);
++        g_clear_pointer (&priv->seat->keyboard_v2,
++                         zwp_input_method_keyboard_grab_v2_release);
+         break;
+     default:
+         g_assert_not_reached ();
+@@ -1945,6 +1965,9 @@
      g_return_if_fail (IBUS_IS_WAYLAND_IM (wlim));
      priv = ibus_wayland_im_get_instance_private (wlim);
      priv->seat->pending_activate = TRUE;
@@ -72,7 +202,7 @@
  }
  
  
-@@ -1985,9 +2001,83 @@
+@@ -1985,9 +2008,83 @@
  static void
  input_method_content_type_v2 (void                       *data,
                                struct zwp_input_method_v2 *input_method_v2,
@@ -157,7 +287,7 @@
  }
  
  
-@@ -2003,6 +2093,12 @@
+@@ -2003,6 +2100,12 @@
      priv = ibus_wayland_im_get_instance_private (wlim);
      priv->serial++;
      input_method.u.input_method_v2 = input_method_v2;
@@ -170,7 +300,7 @@
  
      if (priv->seat->pending_activate && !priv->seat->active) {
          priv->seat->active = TRUE;
-@@ -2020,6 +2116,9 @@
+@@ -2020,6 +2123,9 @@
  input_method_unavailable_v2 (void                       *data,
                               struct zwp_input_method_v2 *input_method_v2)
  {
