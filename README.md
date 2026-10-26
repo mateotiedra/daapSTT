@@ -55,6 +55,11 @@ systemctl --user enable --now voice-daemon
 journalctl --user -u voice-daemon -f
 ```
 
+### Optional keyd failure alert and recovery
+
+Install the portable [keyd recovery configuration](contrib/keyd-recovery/README.md) for a persistent desktop alert when keyd fails and an **Alt+§** Hyprland shortcut to restart it. Plain **§** remains available for typing. The guide covers per-device username/UID rendering, narrowly scoped passwordless restart permission, verification, and removal. No automatic restart is added, preserving keyd's emergency stop.
+
+
 ## Usage
 
 | Action | Result |

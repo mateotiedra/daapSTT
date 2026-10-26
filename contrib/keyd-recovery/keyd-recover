@@ -1,0 +1,14 @@
+#!/bin/sh
+# Invoked directly by Hyprland on Alt+§ release, including while keyd is stopped.
+# Requires permission for this exact sudo command; never opens a password prompt.
+if error=$(/usr/bin/sudo -n /usr/bin/systemctl restart keyd.service 2>&1); then
+    /usr/bin/notify-send --app-name="Keyboard recovery" --urgency=normal \
+        --hint=string:x-canonical-private-synchronous:keyd-status \
+        "Keyboard remapping restarted" \
+        "Alt+Space dictation will reconnect within 10 seconds."
+else
+    /usr/bin/notify-send --app-name="Keyboard recovery" --urgency=critical --expire-time=0 \
+        --hint=string:x-canonical-private-synchronous:keyd-status \
+        "Keyboard recovery failed" "$error"
+    exit 1
+fi

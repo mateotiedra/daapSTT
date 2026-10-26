@@ -1,0 +1,9 @@
+[Unit]
+Description=Notify desktop user when keyd fails
+
+[Service]
+Type=oneshot
+User=@USER@
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+ExecStart=/usr/bin/notify-send --app-name="Keyboard recovery" --urgency=critical --expire-time=0 --hint=string:x-canonical-private-synchronous:keyd-status "Keyboard remapping stopped" "Alt+Space dictation is unavailable. Press Alt+§ to restart keyd. Details: journalctl -u keyd.service -n 20"
