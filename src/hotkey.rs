@@ -44,7 +44,7 @@ enum RawEvent {
 const COOLDOWN_DURATION: Duration = Duration::from_millis(200);
 /// keyd emits a restored Alt synchronously with F24-up, if it restores one.
 const ALT_RESTORE_SETTLE_DURATION: Duration = Duration::from_millis(20);
-const MOUSE_HOLD_DURATION: Duration = Duration::from_secs(1);
+const MOUSE_HOLD_DURATION: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
 enum ReleasePhase {

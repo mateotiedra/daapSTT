@@ -111,7 +111,7 @@ fn cooldown_suppresses_mirrored_f24_sequence_then_retriggers() {
 }
 
 #[test]
-fn mouse_starts_at_one_second_and_releases_in_two_phases() {
+fn mouse_starts_at_half_second_and_releases_in_two_phases() {
     let now = Instant::now();
     let mut state = HotkeyState::default();
     assert_eq!(state.process(RawEvent::MouseDown(1), now), None);
@@ -137,12 +137,12 @@ fn short_mouse_clicks_do_not_accumulate_and_repeats_do_not_restart_hold() {
     let now = Instant::now();
     let mut state = HotkeyState::default();
     assert_eq!(state.process(RawEvent::MouseDown(1), now), None);
-    assert_eq!(state.process(RawEvent::MouseUp(1), now + Duration::from_millis(900)), None);
+    assert_eq!(state.process(RawEvent::MouseUp(1), now + Duration::from_millis(400)), None);
     assert_eq!(state.advance(now + MOUSE_HOLD_DURATION), None);
     let second = now + Duration::from_secs(2);
     assert_eq!(state.process(RawEvent::MouseDown(1), second), None);
-    assert_eq!(state.process(RawEvent::MouseDown(1), second + Duration::from_millis(900)), None);
-    assert_eq!(state.advance(second + Duration::from_millis(999)), None);
+    assert_eq!(state.process(RawEvent::MouseDown(1), second + Duration::from_millis(400)), None);
+    assert_eq!(state.advance(second + Duration::from_millis(499)), None);
     assert_eq!(state.advance(second + MOUSE_HOLD_DURATION), Some(HotkeyEvent::Press));
 }
 
@@ -265,11 +265,11 @@ fn unplugging_pending_mouse_cancels_its_timer_and_replacement_starts_fresh() {
     let now = Instant::now();
     let mut state = HotkeyState::default();
     assert_eq!(state.process(RawEvent::MouseDown(1), now), None);
-    assert_eq!(state.process(RawEvent::MouseDisconnected(1), now + Duration::from_millis(900)), None);
+    assert_eq!(state.process(RawEvent::MouseDisconnected(1), now + Duration::from_millis(400)), None);
     assert_eq!(state.advance(now + MOUSE_HOLD_DURATION), None);
     let replaced = now + Duration::from_secs(2);
     assert_eq!(state.process(RawEvent::MouseDown(2), replaced), None);
-    assert_eq!(state.advance(replaced + Duration::from_millis(999)), None);
+    assert_eq!(state.advance(replaced + Duration::from_millis(499)), None);
     assert_eq!(state.advance(replaced + MOUSE_HOLD_DURATION), Some(HotkeyEvent::Press));
 }
 
