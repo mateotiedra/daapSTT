@@ -1,14 +1,14 @@
 # daapSTT — Voice Input Daemon
 
-Global push-to-talk speech-to-text dictation for Wayland. Hold **Alt+Space**, speak, release — your words appear in the active window.
+Global push-to-talk speech-to-text dictation for Wayland. Hold **Alt+Space**, or hold your mouse's **Forward** button for one second, speak, release — your words appear in the active window.
 
 Uses [ElevenLabs Scribe v2](https://elevenlabs.io/docs/speech-to-text) for transcription: no GPU, CUDA, or local model files are required.
 
 ## How It Works
 
 ```
-Batch: Alt+Space → § marker → speak → release → final text
-Chrome/Discord realtime: Alt+Space → § preedit → live words → release → one final commit
+Batch: activation → § marker → speak → release → final text
+Chrome/Discord realtime: activation → § preedit → live words → release → one final commit
 ```
 
 Native IBus delivery shows `§` immediately, then replaces it with recognized words. Other realtime targets follow their delivery policy described below.
@@ -65,11 +65,13 @@ Install the portable [keyd recovery configuration](contrib/keyd-recovery/README.
 | Action | Result |
 | --- | --- |
 | Hold **Alt+Space** | `§` appears at cursor |
+| Hold mouse **Forward** for 1 second | Recording starts; keep holding while speaking |
 | Speak into mic | Audio captured |
-| Release **Alt+Space** | `§` removed, text appears |
-| Quick tap (< 0.05s) | `§` removed, no action |
+| Release the activating keys or mouse button | Recording stops; `§` removed, text appears |
+| Short mouse Forward click (< 1s) | No dictation; normal mouse action remains available |
+| Quick Alt+Space tap (< 0.05s) | `§` removed, no action |
 
-Batch transcription is the default. In both Batch and Realtime modes, the user hotkey remains **hold Alt+Space and release it to stop**. `F24` is only keyd's internal normalized signal; it is not a second user-facing hotkey.
+Batch and Realtime both support **Alt+Space** immediately and the mouse **Forward** button after a one-second hold. Release the activating control to stop. Speak after recording starts; the first second of a mouse hold is not recorded. Mouse buttons are observed without grabbing them, so Forward also reaches the active application, even on a long hold; browsers may navigate forward. `F24` is only keyd's internal normalized signal, not another user-facing hotkey. Mouse activation reads Linux `BTN_EXTRA` / `BTN_FORWARD` directly and needs no keyd mapping.
 
 While the hotkey is held, the daemon uses PipeWire's PulseAudio compatibility layer (`pactl`) to mute every available audio output that was not already muted. This silences Spotify, YouTube, Discord, and new playback routed to those outputs without pausing or changing playback position. Outputs that were already muted stay muted, and only outputs successfully muted by daapSTT are restored as soon as recording stops—before transcription finishes. A new output device that appears mid-dictation is not part of the initial snapshot.
 
@@ -112,7 +114,7 @@ Keyboard capture is limited to visible IME composition: showing preedit acquires
 
 Native IBus realtime behavior:
 
-- Hold Alt+Space: `§` appears as native preedit, then recognized words replace it progressively. The marker is never included in the final commit. Provider-confirmed segments accumulate in that preedit; no intermediate application commits occur. **Docs may preserve intermediate compositions, including the marker, in its Undo history.**
+- Hold Alt+Space (or hold mouse Forward for one second): `§` appears as native preedit, then recognized words replace it progressively. The marker is never included in the final commit. Provider-confirmed segments accumulate in that preedit; no intermediate application commits occur. **Docs may preserve intermediate compositions, including the marker, in its Undo history.**
 - Release: queued audio is drained, the last server segment is explicitly finalized, and exactly one native commit inserts the provider-confirmed transcript as soon as its acknowledgement arrives. There is no fixed three-second grace period for native IBus delivery. Network/recognition latency can still keep the preedit underlined briefly; an unconfirmed partial is never promoted to final text.
 - During composition, Chromium/Docs displays a temporary underline. It disappears on final commit; it is not document formatting. Chromium's GTK transport supplies this underline even when the engine supplies no underline attribute.
 - Native Chrome's rich-text editor may normalize ordinary spaces to non-breaking spaces to preserve their visible layout. Textarea Unicode scalars remain exact; rich-text space normalization is accepted.
